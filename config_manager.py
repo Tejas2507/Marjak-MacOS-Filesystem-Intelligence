@@ -21,34 +21,52 @@ class ConfigManager:
 
     def _default_config(self) -> dict:
         return {
-            "version": "1.0.0",
+            "version": "1.1.0",
             "active_provider": "ollama",
             "active_model": "gemma4",
             "preset": "Pro",
             "providers": {
-                "ollama": {"model": "gemma4"},
-                "openai": {"model": "gpt-4o-mini", "api_key": ""},
-                "gemini": {"model": "gemini-1.5-flash", "api_key": ""},
-                "claude": {"model": "claude-3-5-sonnet-20240620", "api_key": ""},
-                "groq": {"model": "llama-3.3-70b-versatile", "api_key": ""},
+                "ollama": {"model": "gemma4", "context_window": 131072},
+                "openai": {"model": "gpt-4.1-nano", "api_key": "", "context_window": 1047576},
+                "gemini": {"model": "gemini-2.0-flash-lite", "api_key": "", "context_window": 1048576},
+                "claude": {"model": "claude-3-5-haiku-20241022", "api_key": "", "context_window": 200000},
+                "groq": {"model": "llama-3.3-70b-versatile", "api_key": "", "context_window": 131072},
                 "openrouter": {
-                    "model": "google/gemini-2.0-flash-exp:free", 
+                    "model": "google/gemini-2.0-flash-lite-001", 
                     "api_key": "",
-                    "base_url": "https://openrouter.ai/api/v1"
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "context_window": 1048576
                 }
             },
             "performance": {
-                "Eco": {"nav_loops": 5, "exec_loops": 2, "tree_chars": 6000},
-                "Pro": {"nav_loops": 10, "exec_loops": 5, "tree_chars": 10000},
-                "Expert": {"nav_loops": 20, "exec_loops": 10, "tree_chars": 15000}
+                "Eco": {
+                    "nav_loops": 5, "exec_loops": 2, "tree_chars": 4000,
+                    "max_children": 8, "search_limit": 15,
+                    "memory_hotspots": 5, "memory_actions": 5,
+                    "summary_interval": 3
+                },
+                "Pro": {
+                    "nav_loops": 10, "exec_loops": 5, "tree_chars": 8000,
+                    "max_children": 15, "search_limit": 30,
+                    "memory_hotspots": 10, "memory_actions": 10,
+                    "summary_interval": 4
+                },
+                "Expert": {
+                    "nav_loops": 20, "exec_loops": 10, "tree_chars": 15000,
+                    "max_children": 25, "search_limit": 50,
+                    "memory_hotspots": 15, "memory_actions": 15,
+                    "summary_interval": 6
+                }
             }
         }
 
     def save(self):
         try:
             os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-            with open(CONFIG_PATH, "w") as f:
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self.config, f, indent=4)
+            os.replace(tmp, CONFIG_PATH)
         except IOError:
             pass
 
@@ -63,6 +81,12 @@ class ConfigManager:
     @property
     def api_keys(self):
         return {p: details.get("api_key", "") for p, details in self.config.get("providers", {}).items()}
+
+    @property
+    def context_window(self) -> int:
+        """Returns the context window size for the active provider."""
+        prov = self.config.get("providers", {}).get(self.current_provider, {})
+        return prov.get("context_window", 131072)
 
     def get_performance_settings(self):
         preset = self.config.get("preset", "Pro")

@@ -10,7 +10,7 @@ import uuid
 import time
 import platform
 from datetime import datetime
-from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage, AIMessage
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -35,13 +35,7 @@ console = Console(highlight=False)
 _ANSI_ESCAPE = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]|\x1B[\x40-\x5F]|[\x00-\x08\x0E-\x1F]")
 
 # Markdown patterns to strip from model output
-_MD_BOLD_ITALIC = re.compile(r"\*{1,3}(.+?)\*{1,3}")
-_MD_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
-_MD_TABLE_ROW = re.compile(r"^\|.+\|$", re.MULTILINE)
-_MD_TABLE_SEP = re.compile(r"^\|[-| :]+\|$", re.MULTILINE)
-_MD_CODE_FENCE = re.compile(r"```[a-z]*\n?")
-_MD_INLINE_CODE = re.compile(r"`([^`]+)`")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_FID_PATTERN = re.compile(r"\[FID:\s*\d+\]")
 
 
 def _sanitize_input(text: str) -> str:
@@ -51,30 +45,10 @@ def _sanitize_input(text: str) -> str:
 
 def _clean_model_output(text: str) -> str:
     """
-    Transforms raw model markdown into clean terminal-friendly plain text.
-
-    - Strips **bold**, *italic*, ***bold-italic*** markers
-    - Removes markdown headings (# ## ###)
-    - Strips table separator rows
-    - Converts inline code backticks to plain text
-    - Converts markdown links to just the label
-    - Removes code fence markers
+    Light cleanup for tool results displayed directly (not LLM streaming).
+    Strips leaked FID references and collapses excessive blank lines.
     """
-    # Strip bold/italic markers, keep content
-    text = _MD_BOLD_ITALIC.sub(r"\1", text)
-    # Strip heading markers
-    text = _MD_HEADING.sub("", text)
-    # Remove table separator rows (|---|---|)
-    text = _MD_TABLE_SEP.sub("", text)
-    # Strip inline code backticks
-    text = _MD_INLINE_CODE.sub(r"\1", text)
-    # Strip code fence markers
-    text = _MD_CODE_FENCE.sub("", text)
-    # Strip markdown table data rows
-    text = _MD_TABLE_ROW.sub("", text)
-    # Convert links to label only
-    text = _MD_LINK.sub(r"\1", text)
-    # Collapse triple+ blank lines to double
+    text = _FID_PATTERN.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
@@ -103,23 +77,19 @@ def print_banner(node_count: int = 0, is_fresh: bool = False):
     feat.append("  ·  ", style="dim")
     feat.append("AI Reasoning", style="cyan")
 
-    # ── Command reference — two plain centered lines ---------------
-    cmd1 = Text(justify="center")
-    cmd1.append("/scan",       style="cyan"); cmd1.append(" waste preview", style="dim")
-    cmd1.append("   ")
-    cmd1.append("/deep_clean", style="cyan"); cmd1.append(" purge caches", style="dim")
-    cmd1.append("   ")
-    cmd1.append("/optimize",   style="cyan"); cmd1.append(" tune macOS", style="dim")
-    cmd1.append("   ")
-    cmd1.append("/config",     style="cyan"); cmd1.append(" setup AI", style="dim")
+    # ── Command grid — 4 columns per row, no wrapping ─────────────────
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="cyan", no_wrap=True)
+    grid.add_column(style="dim",  no_wrap=True)
+    grid.add_column(style="cyan", no_wrap=True)
+    grid.add_column(style="dim",  no_wrap=True)
+    grid.add_column(style="cyan", no_wrap=True)
+    grid.add_column(style="dim",  no_wrap=True)
+    grid.add_column(style="cyan", no_wrap=True)
+    grid.add_column(style="dim",  no_wrap=True)
 
-    cmd2 = Text(justify="center")
-    cmd2.append("/playbook",   style="cyan"); cmd2.append(" filesystem map", style="dim")
-    cmd2.append("   ")
-    cmd2.append("/wipe",       style="cyan"); cmd2.append(" nuclear reset", style="dim")
-    cmd2.append("   ")
-    cmd2.append("/quit",       style="cyan"); cmd2.append(" exit", style="dim")
-
+    grid.add_row("/scan", "waste preview", "/deep_clean", "purge caches", "/optimize", "tune macOS", "/config", "setup AI")
+    grid.add_row("/playbook", "filesystem map", "/wipe", "nuclear reset", "/quit", "exit", "", "")
 
     # ── Session status line ─────────────────────────────────────────
     if is_fresh:
@@ -143,8 +113,7 @@ def print_banner(node_count: int = 0, is_fresh: bool = False):
         Text(""),
         Rule(style="dim cyan"),
         Text(""),
-        cmd1,
-        cmd2,
+        Align.center(grid),
         Text(""),
         Rule(style="dim cyan"),
         Text(""),
@@ -154,73 +123,48 @@ def print_banner(node_count: int = 0, is_fresh: bool = False):
     )
 
     console.print()
-    console.print(Panel(
+    # Centering a fixed-width panel to "extend" it horizontally
+    console.print(Align.center(Panel(
         content,
         border_style="cyan",
+        width=104,
         padding=(0, 4),
-        expand=True,
-    ))
+    )))
     console.print()
 
 
-def stream_agent(app, inputs, config, max_loops=15):
-    """Streams an agent's logic to the console.
-    Token streaming is handled by agent.py natively.
-    This loop only renders tool calls and transient tool results.
-    """
-    from rich.live import Live
-    tool_call_count = 0
-    _pending_tool_name = None
+def _recommend_preset(provider: str, model: str) -> str:
+    """Suggest a preset based on the provider and model name."""
+    model_lower = model.lower()
 
-    for msg_chunk, metadata in app.stream(inputs, config, stream_mode="messages"):
+    # Cloud providers with large context windows → default higher
+    if provider in ("claude", "openai"):
+        if any(k in model_lower for k in ("haiku", "mini", "nano", "flash")):
+            return "Pro"
+        return "Expert"
+    if provider == "gemini":
+        if "flash" in model_lower:
+            return "Pro"
+        return "Expert"
+    if provider == "groq":
+        # Groq is fast inference but often smaller effective context
+        return "Eco"
+    if provider == "openrouter":
+        return "Pro"
 
-        if msg_chunk.type == "ai":
-            if hasattr(msg_chunk, "tool_calls") and msg_chunk.tool_calls:
-                for chunk in msg_chunk.tool_calls:
-                    if "name" in chunk and chunk["name"]:
-                        tool_call_count += 1
-                        _pending_tool_name = chunk["name"]
-                        console.print(
-                            f"[dim cyan]▶  {chunk['name']}[/dim cyan]",
-                            end="",
-                        )
-                    if "args" in chunk and chunk["args"]:
-                        args = chunk["args"]
-                        # Trim very long arg dumps
-                        args_str = str(args)
-                        if len(args_str) > 80:
-                            args_str = args_str[:77] + "…"
-                        console.print(f"  [dim]{args_str}[/dim]", end="")
-
-        elif msg_chunk.type == "tool":
-            # Flash a one-line result indicator transiently, then erase it
-            result_raw = _clean_model_output(str(msg_chunk.content))
-            # Collapse to first non-empty line as the summary
-            summary_line = next(
-                (l.strip() for l in result_raw.splitlines() if l.strip()), "✔ done"
-            )
-            if len(summary_line) > 90:
-                summary_line = summary_line[:87] + "…"
-            with Live(
-                Text.from_markup(f"[dim green]✔  {summary_line}[/dim green]"),
-                console=console,
-                transient=True,
-                refresh_per_second=4,
-            ):
-                import time as _t; _t.sleep(0.6)   # brief flash so user sees it
-            # Newline after the tool call label
-            console.print()
-
-    console.print()
-
-    # Check for empty response
-    final_state = app.get_state(config)
-    if final_state and "messages" in final_state.values:
-        last_msg = final_state.values["messages"][-1]
-        if isinstance(last_msg, AIMessage) and not last_msg.content and not last_msg.tool_calls:
-            console.print(
-                "[bold yellow]⚠  No response. Try a more specific request.[/bold yellow]\n"
-            )
+    # Ollama / local: infer from model size in name
+    import re as _re
+    match = _re.search(r"(\d+)[bB]", model_lower)
+    if match:
+        param_b = int(match.group(1))
+        if param_b <= 12:
+            return "Eco"
+        elif param_b <= 35:
+            return "Pro"
+        else:
+            return "Expert"
+    # Fallback
+    return "Pro"
 
 
 def run_config_wizard():
@@ -253,17 +197,21 @@ def run_config_wizard():
         default=current_model
     )
 
-    # 4. Performance Preset
+    # 4. Performance Preset with model-aware recommendations
     console.print("\n[bold]Performance Presets:[/bold]")
-    console.print("  - [cyan]Eco[/cyan]:    Fast, low-intensity analysis (best for quick summaries)")
-    console.print("  - [cyan]Pro[/cyan]:    Balanced research and deep folder mapping (Recommended)")
-    console.print("  - [cyan]Expert[/cyan]: High-intensity exhaustive search (Thorough but slower)\n")
+    console.print("  - [cyan]Eco[/cyan]:    Small/fast models (\u226412B params), quick summaries, minimal context")
+    console.print("  - [cyan]Pro[/cyan]:    Mid-range models (12B\u201370B), balanced depth and speed")
+    console.print("  - [cyan]Expert[/cyan]: Large models (\u226570B) or cloud APIs, exhaustive analysis\n")
+
+    # Auto-recommend preset based on provider and model
+    recommended = _recommend_preset(choice, model_name)
+    console.print(f"  [dim]Recommended for {choice}/{model_name}: [bold cyan]{recommended}[/bold cyan][/dim]")
     
     current_preset = config_manager.config.get("preset", "Pro")
     preset = Prompt.ask(
         "Select Performance Preset",
         choices=["Eco", "Pro", "Expert"],
-        default=current_preset
+        default=recommended
     )
 
     # Save
@@ -275,79 +223,59 @@ def run_config_wizard():
 
 
 def stream_agent(app, inputs, config, max_loops=15):
-    """Event loop for streaming agent output with reasoning extraction and transient tool UI."""
+    """Event loop for agent execution.
+
+    Token streaming is handled by agent.py's _stream_and_log natively.
+    This loop only renders tool-call invocations and transient tool results;
+    it never prints AI content (that would double-print).
+    """
     from rich.live import Live
-    import itertools
 
-    spinner = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-    
-    with Live(Text(""), console=console, transient=True, refresh_per_second=10) as live:
-        last_msg_id = None
-        printed_len = 0
+    for msg_chunk, metadata in app.stream(inputs, config, stream_mode="messages"):
 
-        for chunk in app.stream(inputs, config, stream_mode="messages"):
-            msg, metadata = chunk
-            
-            # Avoid doubling: Only use AIMessageChunk for streaming output.
-            # Completed AIMessages from nodes are ignored as they've already been streamed.
-            is_chunk = isinstance(msg, AIMessageChunk)
-            
-            # Reset tracking if this is a new message ID
-            if hasattr(msg, "id") and msg.id and msg.id != last_msg_id:
-                last_msg_id = msg.id
-                printed_len = 0
+        # ── Tool-call invocations ─────────────────────────────────
+        if hasattr(msg_chunk, "tool_calls") and msg_chunk.tool_calls:
+            for tc in msg_chunk.tool_calls:
+                name = tc.get("name")
+                if name:
+                    args_str = str(tc.get("args", ""))
+                    if len(args_str) > 80:
+                        args_str = args_str[:77] + "…"
+                    console.print(
+                        f"  [dim cyan]▶  {name}[/dim cyan]"
+                        + (f"  [dim]{args_str}[/dim]" if args_str else "")
+                    )
+            continue
 
-            # Handle tool calls (transient status)
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tname = msg.tool_calls[0]["name"]
-                live.update(Text.from_markup(f"[dim yellow]  ◌  Invoking {tname}…[/dim yellow]"))
-                continue
+        # ── Tool results (transient flash) ────────────────────────
+        if hasattr(msg_chunk, "type") and msg_chunk.type == "tool":
+            result_raw = _clean_model_output(str(msg_chunk.content))
+            summary = next(
+                (l.strip() for l in result_raw.splitlines() if l.strip()), "done"
+            )
+            if len(summary) > 90:
+                summary = summary[:87] + "…"
+            with Live(
+                Text.from_markup(f"  [dim green]✔  {summary}[/dim green]"),
+                console=console,
+                transient=True,
+                refresh_per_second=4,
+            ):
+                time.sleep(0.35)
+            continue
 
-            # Handle tool results (transient flash)
-            if hasattr(msg, "type") and msg.type == "tool":
-                res = str(msg.content)[:80].replace("\n", " ")
-                live.update(Text.from_markup(f"[dim green]  ✔  {res}…[/dim green]"))
-                time.sleep(0.1) # Brief pause to show result
-                continue
+        # ── AI content: skip (already printed by _stream_and_log) ─
+        # Nothing to do here — agent.py streams tokens to stdout.
 
-            if not msg.content:
-                # Still thinking? Show spinner
-                excerpt = ""
-                if hasattr(msg, "response_metadata") and "reasoning" in msg.response_metadata:
-                    excerpt = msg.response_metadata["reasoning"][-60:].replace("\n", " ")
-                frame = next(spinner)
-                live.update(Text.from_markup(
-                    f"[dim magenta]{frame}  Thinking …[/dim magenta]" + 
-                    (f" [dim]({excerpt})[/dim]" if excerpt else "")
-                ))
-                continue
-            
-            # Content arrival: If it's a chunk, print the NEW part.
-            # If it's a full AIMessage and NOT a chunk, it's redundant (skip).
-            if not is_chunk and isinstance(msg, AIMessage):
-                continue
-
-            if live.is_started:
-                live.stop()
-            
-            # Extract content (handling both deltas and accumulated strings safely)
-            full_content = msg.content
-            # If the provider sends deltas, printed_len will stay 0 for each chunk's content
-            # If the provider sends accumulated text, printed_len will prevent duplicates
-            new_content = full_content[printed_len:]
-            
-            if new_content:
-                clean = _clean_model_output(new_content)
-                if clean:
-                    sys.stdout.write(clean)
-                    sys.stdout.flush()
-                
-                if not is_chunk: 
-                    # If we somehow got a full message, track its length
-                    printed_len = len(full_content)
-        
-        # Ensure a final newline after streaming completes
-        print()
+    # Check for empty response
+    final_state = app.get_state(config)
+    if final_state and "messages" in final_state.values:
+        last_msg = final_state.values["messages"][-1]
+        if isinstance(last_msg, AIMessage) and not last_msg.content and not last_msg.tool_calls:
+            console.print(
+                "[bold yellow]⚠  No response. Try a more specific request.[/bold yellow]"
+            )
+    console.print()
 
 def main():
     # Gather session state before printing banner

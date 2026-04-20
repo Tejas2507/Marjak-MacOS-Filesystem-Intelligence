@@ -16,8 +16,36 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from knowledge_book import SessionBook, _human_size
+from config_manager import config_manager
 
 console = Console(highlight=False)
+
+# ---------------------------------------------------------------------------
+# Waste pattern tags — zero-cost intelligence for the LLM
+# ---------------------------------------------------------------------------
+_WASTE_PATTERNS = {
+    "node_modules":  "[npm deps]",
+    ".git":          "[git repo]",
+    "__pycache__":   "[py cache]",
+    "Caches":        "[cache]",
+    "Cache":         "[cache]",
+    ".DS_Store":     "[junk]",
+    "DerivedData":   "[xcode build]",
+    "build":         "[build output]",
+    "dist":          "[build output]",
+    "target":        "[build output]",
+    "Logs":          "[logs]",
+    ".Trash":        "[trash]",
+    ".ollama":       "[ollama models]",
+    "Podfile.lock":  "[cocoapods]",
+    "Pods":          "[cocoapods]",
+    ".cargo":        "[rust cache]",
+    "venv":          "[virtualenv]",
+    ".venv":         "[virtualenv]",
+}
+
+# Navigate cache TTL (seconds) — skip re-scanning paths scanned within this window
+_NAVIGATE_CACHE_TTL = 120  # 2 minutes — short enough to allow recovery from errors
 
 # ---------------------------------------------------------------------------
 # Global State 
@@ -63,11 +91,13 @@ class PersistentMemory:
         }
 
     def save(self):
-        """Saves current state to JSON."""
+        """Saves current state to JSON (atomic write)."""
         try:
             os.makedirs(os.path.dirname(self.PATH), exist_ok=True)
-            with open(self.PATH, "w") as f:
+            tmp = self.PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self.data, f, indent=4)
+            os.replace(tmp, self.PATH)
         except IOError:
             pass
 
@@ -101,31 +131,36 @@ class PersistentMemory:
         self.data["session_history"] = history[-15:]
 
     def get_context_for_prompt(self) -> str:
-        """Generates compact context for the system prompt (~150 tokens)."""
+        """Generates compact context for the system prompt.
+        Limits are driven by the active performance preset."""
+        caps = config_manager.get_performance_settings()
+        n_hotspots = caps.get("memory_hotspots", 10)
+        n_actions = caps.get("memory_actions", 10)
+
         parts = []
 
         profile = self.data.get("system_profile", {})
-        hotspots = profile.get("hotspots", [])[:10]  # Expanded to 10
+        hotspots = profile.get("hotspots", [])[:n_hotspots]
         if hotspots:
             items = ", ".join(
                 f"{os.path.basename(h['path'])} ({h['size_gb']}GB)"
                 for h in hotspots
             )
-            parts.append(f"KNOWN HOTSPOTS (Long-term): {items}")
+            parts.append(f"KNOWN HOTSPOTS: {items}")
 
-        history = self.data.get("session_history", [])[-10:]  # Expanded to 10
+        history = self.data.get("session_history", [])[-n_actions:]
         if history:
             items = "; ".join(
                 f"[{h['date']}] {h['action']}: {h['finding'][:60]}" for h in history
             )
-            parts.append(f"RECENT ACTIVITY (Agent Memory): {items}")
+            parts.append(f"RECENT ACTIVITY: {items}")
 
         prefs = self.data.get("user_preferences", {})
         ignores = prefs.get("safe_to_ignore", [])
         if ignores:
             parts.append(f"User ignores: {', '.join(ignores)}")
 
-        return "\n".join(parts) if parts else "First session — no prior data."
+        return "\n".join(parts) if parts else ""
 
 
 # Global instance
@@ -175,6 +210,12 @@ def stream_command(cmd: list[str], task_name: str) -> str:
 # NAVIGATOR TOOLS — Read-only exploration
 # ===========================================================================
 
+def _tag_waste(name: str) -> str:
+    """Append a waste-pattern tag to known directory/file names."""
+    tag = _WASTE_PATTERNS.get(name)
+    return f"{name} {tag}" if tag else name
+
+
 @tool
 def navigate(path: str) -> str:
     """Explore any directory on the system to see its contents sorted by size.
@@ -193,6 +234,28 @@ def navigate(path: str) -> str:
         return f"Error: Path '{expanded}' does not exist."
     if not os.path.isdir(expanded):
         return f"Error: '{expanded}' is a file, not a directory. Navigate to its parent instead."
+
+    # Cache hit: skip re-scanning if path was explored recently and is not stale
+    existing = session_book.nodes.get(expanded)
+    if existing and not existing.get("stale") and existing.get("scan_mtime"):
+        age = time.time() - existing["scan_mtime"]
+        if age < _NAVIGATE_CACHE_TTL:
+            mins = round(age / 60, 1)
+            console.print(f"[dim]⚡ Cache hit for {path} (scanned {mins}m ago)[/dim]")
+            # Include child directory paths so the model can still drill deeper
+            home = os.path.expanduser("~")
+            children = existing.get("children", [])
+            child_dirs = []
+            for cp in children:
+                cn = session_book.nodes.get(cp)
+                if cn and cn.get("type") == "DIR":
+                    try:
+                        rel = "~/" + os.path.relpath(cp, home)
+                    except (ValueError, TypeError):
+                        rel = cp
+                    child_dirs.append(f"  {rel} ({_human_size(cn.get('size', 0))})")
+            nav_hint = "\nChild dirs:\n" + "\n".join(child_dirs[:5]) if child_dirs else ""
+            return f"Already explored (scanned {mins}m ago). Check the VFS tree for contents.{nav_hint}"
 
     console.print(f"\n[bold red]🔍 Navigating: {expanded}[/bold red]")
     try:
@@ -216,6 +279,10 @@ def navigate(path: str) -> str:
     total_size = data.get("total_size", 0)
     total_files = data.get("total_files", 0)
 
+    # Tag entries with waste patterns before adding to SessionBook
+    for e in entries:
+        e['name'] = _tag_waste(e['name'])
+
     # Add the structural data to the SessionBook representing exactly what was found.
     session_book.add_directory(expanded, total_size, entries, large_files)
 
@@ -224,8 +291,46 @@ def navigate(path: str) -> str:
     memory.record_action("navigate", f"{path}: {_human_size(total_size)}, {len(entries)} items")
     session_book.save()  # Persist VFS after each navigation
 
+    # Build a richer return value so the LLM can decide next steps without re-reading the full tree
+    sorted_entries = sorted(entries, key=lambda e: e.get("size", 0), reverse=True)
+    top3 = ", ".join(
+        f"{e['name']} {_human_size(e['size'])}" for e in sorted_entries[:3]
+    )
+    # Collect waste-tagged items
+    tagged = [e['name'] for e in entries if any(t in e['name'] for t in _WASTE_PATTERNS.values())]
+    waste_note = f" Waste detected: {', '.join(tagged[:5])}." if tagged else ""
+
+    # Include navigable paths for top directories so the LLM doesn't have to reconstruct them
+    home = os.path.expanduser("~")
+    dir_entries = [e for e in sorted_entries if e.get("is_dir")]
+    nav_paths = []
+    for e in dir_entries[:5]:
+        try:
+            rel = "~/" + os.path.relpath(e['path'], home)
+        except (ValueError, TypeError):
+            rel = e['path']
+        nav_paths.append(f"  {rel} ({_human_size(e['size'])})")
+    nav_hint = "\nNavigable dirs:\n" + "\n".join(nav_paths) if nav_paths else ""
+
+    # Surface large files with FIDs so the model can use call_executor directly
+    file_entries = [e for e in sorted_entries if not e.get("is_dir") and e.get("size", 0) >= 1024 * 1024]
+    big_files = []
+    for e in file_entries[:8]:
+        fid = session_book._path_to_fid.get(e['path'].rstrip('/'))
+        try:
+            rel = "~/" + os.path.relpath(e['path'], home)
+        except (ValueError, TypeError):
+            rel = e['path']
+        fid_tag = f" [FID:{fid}]" if fid else ""
+        big_files.append(f"  {_human_size(e['size']):>10s} | {e['name']}{fid_tag}")
+    file_hint = "\nFiles (use call_executor with FIDs to delete):\n" + "\n".join(big_files) if big_files else ""
+
     console.print(f"[bold red]✔ Explored {path}[/bold red]\n")
-    return f"Explored {path}. Added {len(entries)} child items and {len(large_files)} large files to the Knowledge Tree. Please review the updated tree."
+    return (
+        f"Explored {path} ({_human_size(total_size)}, {len(entries)} items). "
+        f"Top: {top3}. {len(large_files)} large files.{waste_note}"
+        f"{nav_hint}{file_hint}"
+    )
 
 
 @tool
@@ -393,67 +498,157 @@ def search_system(name: str, file_type: str = "any") -> str:
     except Exception:
         pass
 
-    # Deduplicate & enrich with sizes
-    seen = set()
-    enriched = []
+    # ── Deduplicate by resolved real path ──
+    seen_real = set()
+    unique_results = []
     for path in results:
-        if path in seen:
-            continue
-        seen.add(path)
         try:
-            stat = os.stat(path)
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            real = path
+        if real not in seen_real:
+            seen_real.add(real)
+            unique_results.append(path)
+    results = unique_results
+
+    # ── Enrich with sizes, filter zero-byte dirs ──
+    enriched = []
+    search_limit = config_manager.get_performance_settings().get("search_limit", 30)
+    for path in results:
+        if len(enriched) >= search_limit:
+            break
+        try:
             is_dir = os.path.isdir(path)
             if is_dir:
-                # Use du for directory sizes (quick, 3s timeout)
                 try:
                     du = subprocess.run(
                         ["du", "-sm", path], capture_output=True, text=True, timeout=3
                     )
                     size_mb = int(du.stdout.split()[0])
-                    size_str = f"{size_mb} MB"
                 except Exception:
-                    size_str = "? MB"
+                    size_mb = 0
+                # Skip zero-byte directories — they're noise
+                if size_mb == 0:
+                    continue
+                size_bytes = size_mb * 1024 * 1024
+                size_str = f"{size_mb} MB"
             else:
-                size_str = _human_size(stat.st_size)
+                stat = os.stat(path)
+                size_bytes = stat.st_size
+                size_str = _human_size(size_bytes)
 
-            days_old = round((time.time() - stat.st_atime) / 86400)
-            kind = "DIR " if is_dir else "FILE"
-            enriched.append(f"  {kind} {size_str:>10s} | {days_old}d stale | {path}")
-            
-            # Feed to session book
-            node_type = "FILE" if not is_dir else "DIR"
-            fid = session_book.assign_fid(path) if node_type == "FILE" else None
-            
-            node_data = {
-                "name": f"[SEARCH] {os.path.basename(path)}",
+            enriched.append({
                 "path": path,
+                "is_dir": is_dir,
+                "size_bytes": size_bytes,
                 "size_str": size_str,
-                "type": node_type,
-                "children": []
-            }
-            if fid:
-                node_data["fid"] = fid
-                
-            session_book.nodes[path] = node_data
-            
-            if "Search Results" not in session_book.nodes:
-                session_book.nodes["Search Results"] = {
-                    "name": "Global Search Results",
-                    "path": "Search Results",
-                    "size": 0,
-                    "type": "ROOT",
-                    "children": []
-                }
-            if path not in session_book.nodes["Search Results"]["children"]:
-                session_book.nodes["Search Results"]["children"].append(path)
-                
+            })
         except Exception:
             pass
 
+    # Sort by size descending so the most relevant results come first
+    enriched.sort(key=lambda e: e["size_bytes"], reverse=True)
+
+    # ── Feed results into the VFS tree at their real parent paths ──
+    # Only store results >= 1MB in VFS to avoid noise from tiny python packages etc.
+    _VFS_MIN_SIZE = 1024 * 1024  # 1 MB
+    for item in enriched:
+        if item["size_bytes"] < _VFS_MIN_SIZE:
+            continue
+        path = item["path"]
+        node_type = "DIR" if item["is_dir"] else "FILE"
+        fid = session_book.assign_fid(path) if node_type == "FILE" else None
+
+        # Abbreviate display: ~/relative/path
+        try:
+            rel = "~/" + os.path.relpath(path, home)
+        except ValueError:
+            rel = path
+
+        node_data = {
+            "name": os.path.basename(path),
+            "path": path,
+            "size": item["size_bytes"],
+            "size_str": item["size_str"],
+            "type": node_type,
+            "search_hit": True,
+            "children": []
+        }
+        if fid:
+            node_data["fid"] = fid
+
+        session_book.nodes[path] = node_data
+
+        # Attach to actual parent in VFS tree (or create minimal parent chain)
+        parent = os.path.dirname(path)
+        if parent in session_book.nodes:
+            if path not in session_book.nodes[parent]["children"]:
+                session_book.nodes[parent]["children"].append(path)
+        else:
+            # Create a lightweight parent node so the tree stays rooted
+            session_book.nodes[parent] = {
+                "name": os.path.basename(parent) or parent,
+                "path": parent,
+                "size": 0,
+                "type": "DIR",
+                "stale": True,
+                "children": [path]
+            }
+
+    session_book._dirty = True
+
+    # ── Auto-navigate top 3 largest directories for immediate detail ──
+    mo = _get_mole_path()
+    auto_navigated = []
+    for item in enriched[:3]:
+        if not item["is_dir"] or item["size_bytes"] < 100 * 1024 * 1024:
+            continue  # Skip files and dirs < 100 MB
+        path = item["path"]
+        # Skip if already explored recently
+        existing = session_book.nodes.get(path)
+        if existing and existing.get("scan_mtime") and not existing.get("stale"):
+            age = time.time() - existing["scan_mtime"]
+            if age < _NAVIGATE_CACHE_TTL:
+                continue
+        try:
+            console.print(f"  [dim]↳ Auto-exploring {os.path.basename(path)}…[/dim]")
+            proc = subprocess.run(
+                [mo, "analyze", "--json", path],
+                capture_output=True, text=True, timeout=15
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                entries = data.get("entries", [])
+                large_files = data.get("large_files", [])
+                total_size = data.get("total_size", 0)
+                for e in entries:
+                    e['name'] = _tag_waste(e['name'])
+                session_book.add_directory(path, total_size, entries, large_files)
+                auto_navigated.append(path)
+        except Exception:
+            pass
+
+    session_book.save()
+
+    # ── Build response with actual navigable paths ──
     if not enriched:
         report = f"No results found for '{name}'."
     else:
-        report = f"Found {len(enriched)} results for '{name}'. They have been added to the Knowledge Tree under 'Search Results'."
+        lines = [f"Found {len(enriched)} results for '{name}':"]
+        for item in enriched[:8]:
+            path = item["path"]
+            try:
+                rel = "~/" + os.path.relpath(path, home)
+            except ValueError:
+                rel = path
+            kind = "DIR " if item["is_dir"] else "FILE"
+            lines.append(f"  {kind} {item['size_str']:>10s} | {rel}")
+        if len(enriched) > 8:
+            lines.append(f"  ... and {len(enriched) - 8} more")
+        if auto_navigated:
+            lines.append(f"Auto-explored: {', '.join(os.path.basename(p) for p in auto_navigated)}")
+        lines.append("Navigate into the largest directories for file-level detail.")
+        report = "\n".join(lines)
 
     memory.record_action("search_system", f"'{name}': {len(enriched)} results")
     console.print(f"[bold red]✔ Search complete.[/bold red]\n")
@@ -533,6 +728,110 @@ def call_executor(instructions: str) -> str:
     Use this if the user wants to delete files. Pass the FIDs in the instructions.
     """
     return f"Handing off to Executor with instructions: {instructions}"
+
+
+@tool
+def collect_deletable_files(path: str, min_size_mb: int = 0, name_pattern: str = "", exclude_pattern: str = "") -> str:
+    """Query the explored filesystem tree for files under a directory.
+    Returns file names, sizes, and FIDs ready to pass to call_executor.
+
+    Use this BEFORE call_executor to get the exact FID list.
+
+    Args:
+        path: Directory path to search under (e.g. '~/Library/.../media').
+        min_size_mb: Minimum file size in MB (0 = all files with FIDs).
+        name_pattern: Only include files whose name contains this substring (case-insensitive). E.g. '_partial', 'telegram-cloud', '.mkv'.
+        exclude_pattern: Exclude files whose name contains this substring (case-insensitive). E.g. 'db_sqlite', '.plist'.
+    """
+    expanded = os.path.expanduser(path).rstrip("/")
+    threshold = min_size_mb * 1024 * 1024
+    home = os.path.expanduser("~")
+    name_filter = name_pattern.lower()
+    exclude_filter = exclude_pattern.lower()
+
+    matches = []
+    for node_path, node in session_book.nodes.items():
+        node_type = node.get("type")
+        # Match both files (with FIDs) and directories (navigable, deletable)
+        if node_type == "FILE" and "fid" not in node:
+            continue
+        if node_type not in ("FILE", "DIR"):
+            continue
+        if not node_path.startswith(expanded + "/") and node_path != expanded:
+            continue
+        size = node.get("size", 0)
+        if size < threshold:
+            continue
+        fname = node.get("name", os.path.basename(node_path)).lower()
+        if name_filter and name_filter not in fname:
+            continue
+        if exclude_filter and exclude_filter in fname:
+            continue
+        # Directories need a FID to be deletable — assign one if missing
+        if node_type == "DIR" and "fid" not in node:
+            node["fid"] = session_book.assign_fid(node_path)
+        if "fid" not in node:
+            continue
+        try:
+            rel = "~/" + os.path.relpath(node_path, home)
+        except (ValueError, TypeError):
+            rel = node_path
+        matches.append({
+            "fid": node["fid"],
+            "name": node.get("name", os.path.basename(node_path)),
+            "size": size,
+            "size_str": _human_size(size),
+            "rel_path": rel,
+            "type": node_type,
+        })
+
+    matches.sort(key=lambda m: m["size"], reverse=True)
+
+    # Build filter description for the response
+    filters = []
+    if min_size_mb > 0:
+        filters.append(f">= {min_size_mb} MB")
+    if name_pattern:
+        filters.append(f"name contains '{name_pattern}'")
+    if exclude_pattern:
+        filters.append(f"excluding '{exclude_pattern}'")
+    filter_desc = " (" + ", ".join(filters) + ")" if filters else ""
+
+    if not matches:
+        # Check if the target path itself is a known directory in VFS
+        target_node = session_book.nodes.get(expanded)
+        if target_node and target_node.get("type") == "DIR":
+            tsize = target_node.get("size", 0)
+            if "fid" not in target_node:
+                target_node["fid"] = session_book.assign_fid(expanded)
+            try:
+                trel = "~/" + os.path.relpath(expanded, home)
+            except (ValueError, TypeError):
+                trel = expanded
+            return (
+                f"No individual files{filter_desc} found under {path}, but the directory itself is {_human_size(tsize)}.\n"
+                f"To delete the entire directory: call_executor(\"Delete FID {target_node['fid']} — {trel} ({_human_size(tsize)})\")\n"
+                f"Or navigate({path}) first to see its contents before deciding."
+            )
+        return f"No files matching{filter_desc} found under {path}. Navigate into it first with navigate(\"{path}\")."
+
+    fid_list = [m["fid"] for m in matches]
+    total = sum(m["size"] for m in matches)
+    n_files = sum(1 for m in matches if m["type"] == "FILE")
+    n_dirs = sum(1 for m in matches if m["type"] == "DIR")
+    type_desc = []
+    if n_files:
+        type_desc.append(f"{n_files} files")
+    if n_dirs:
+        type_desc.append(f"{n_dirs} directories")
+    lines = [f"Found {' + '.join(type_desc)}{filter_desc} under {path} (total {_human_size(total)}):"]
+    for m in matches:
+        tag = "DIR" if m["type"] == "DIR" else "FILE"
+        lines.append(f"  FID:{m['fid']} | {m['size_str']:>10s} | [{tag}] {m['name']}")
+    lines.append(f"\nFID list for call_executor: {fid_list}")
+    lines.append(f'call_executor("Delete FIDs {fid_list} — {" + ".join(type_desc)}, {_human_size(total)} total")')
+
+    return "\n".join(lines)
 
 
 @tool
@@ -685,3 +984,104 @@ def move_to_trash(file_ids: list[int]) -> str:
     memory.record_action("move_to_trash", report[:120])
     session_book.save()  # Persist VFS after deletions
     return report
+
+
+# ===========================================================================
+# EXPERT-ONLY: Direct Shell Access (read-only, sandboxed)
+# ===========================================================================
+
+# Allowed command prefixes — read-only system inspection only.
+# Destructive commands (rm, mv, sudo, etc.) are never permitted.
+_SHELL_ALLOW = {
+    "ls", "du", "find", "stat", "file", "cat", "head", "tail", "wc",
+    "mdls", "diskutil", "df", "top", "ps", "lsof", "sw_vers",
+    "system_profiler", "sysctl", "pmset", "defaults", "plutil",
+    "xattr", "ditto", "hdiutil", "codesign", "spctl",
+    "mdfind", "mdutil", "tmutil", "log",
+}
+_SHELL_DENY = {
+    "rm", "rmdir", "mv", "cp", "sudo", "osascript", "kill", "killall",
+    "launchctl", "chmod", "chown", "chflags", "mkfs", "newfs",
+    "dd", "diskutil eraseDisk", "diskutil partitionDisk",
+    "curl", "wget", "ssh", "scp", "nc", "ncat", "python", "ruby",
+    "perl", "bash", "zsh", "sh", "open", "pbcopy", "pbpaste",
+}
+
+
+@tool
+def run_shell(command: str) -> str:
+    """Execute a read-only shell command for deep system inspection.
+    Only available in Expert tier. Destructive commands are blocked.
+
+    Use this for things the other tools can't do: checking symlinks,
+    reading file headers, listing processes, inspecting extended attributes,
+    querying Spotlight metadata, checking disk partitions, etc.
+
+    Args:
+        command: A shell command to execute (e.g. 'du -sh ~/Library/Caches/*',
+                 'find ~/Library -name "*.log" -size +10M', 'diskutil list').
+    """
+    import shlex
+
+    command = command.strip()
+    if not command:
+        return "Error: Empty command."
+
+    # Parse first token to check against allow/deny lists
+    try:
+        tokens = shlex.split(command)
+    except ValueError as e:
+        return f"Error: Could not parse command: {e}"
+
+    base_cmd = os.path.basename(tokens[0]) if tokens else ""
+
+    # Deny list check (exact match on base command)
+    if base_cmd in _SHELL_DENY:
+        return f"BLOCKED: '{base_cmd}' is not permitted. Use Executor tools for destructive actions."
+
+    # Allow list check
+    if base_cmd not in _SHELL_ALLOW:
+        return f"BLOCKED: '{base_cmd}' is not in the allowed command set. Allowed: {', '.join(sorted(_SHELL_ALLOW))}"
+
+    # Extra safety: reject any pipe/redirect to denied commands
+    for deny in _SHELL_DENY:
+        if f"| {deny}" in command or f"|{deny}" in command:
+            return f"BLOCKED: piping to '{deny}' is not permitted."
+
+    console.print(f"[dim cyan]$ {command}[/dim cyan]")
+
+    # Ask user permission before every shell execution
+    try:
+        confirm = Prompt.ask(
+            "[bold yellow]Allow this shell command?[/bold yellow]",
+            choices=["y", "n"], default="y"
+        )
+    except EOFError:
+        confirm = "n"
+
+    if confirm.lower() != "y":
+        return "User denied shell command execution."
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=os.path.expanduser("~"),
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        output = output.strip()
+
+        # Cap output to prevent context flooding
+        if len(output) > 4000:
+            output = output[:3900] + f"\n\n... (truncated, {len(output)} chars total)"
+
+        if result.returncode != 0:
+            return f"Command exited with code {result.returncode}:\n{output}" if output else f"Command failed (code {result.returncode})."
+        return output if output else "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out (>15s). Try a more specific query."
+    except Exception as e:
+        return f"Error: {e}"

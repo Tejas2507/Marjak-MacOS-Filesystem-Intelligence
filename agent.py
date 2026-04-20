@@ -22,6 +22,7 @@ from rich.text import Text
 from datetime import datetime
 import itertools
 import threading
+import re 
 from config_manager import config_manager
 
 from tools import (
@@ -29,6 +30,8 @@ from tools import (
     mole_scan,
     search_system,
     get_system_overview,
+    collect_deletable_files,
+    run_shell,
     execute_deep_clean,
     run_system_optimization,
     move_to_trash,
@@ -37,9 +40,11 @@ from tools import (
     memory as persistent_memory,
     session_book,
 )
-from prompts import NAVIGATOR_PROMPT, EXECUTOR_PROMPT
+from prompts import get_navigator_prompt, get_executor_prompt
+from guidebook import retrieve_guidebook
 import time
 import os
+import sys
 
 # Top-level console (highlight=False to prevent random blue numbers)
 _console = Console(highlight=False)
@@ -139,7 +144,7 @@ class ContextManager:
     @staticmethod
     def isolate_for_agent(messages: list[BaseMessage], agent_type: str) -> list[BaseMessage]:
         """Ensures agents only see their relevant history to prevent cross-agent confusion."""
-        nav_tool_names = {"navigate", "mole_scan", "search_system", "get_system_overview", "call_executor"}
+        nav_tool_names = {"navigate", "search_system", "get_system_overview", "collect_deletable_files", "call_executor", "run_shell"}
         exec_tool_names = {"execute_deep_clean", "run_system_optimization", "move_to_trash", "call_navigator"}
         
         my_tools = nav_tool_names if agent_type == "navigator" else exec_tool_names
@@ -182,12 +187,49 @@ class ContextManager:
         return filtered
 
     @staticmethod
+    def summarize_old_tool_results(messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Aggressively compress old tool results to prevent context rot.
+
+        Strategy:
+        - Last 3 ToolMessages (by position): keep verbatim.
+        - Older ToolMessages: keep only the first line (summary).
+        - "Already explored" navigate results: replace with short tag.
+        - The VFS tree is refreshed every turn, so old results are redundant.
+        """
+        last_human_idx = -1
+        for i, m in enumerate(messages):
+            if isinstance(m, HumanMessage):
+                last_human_idx = i
+
+        if last_human_idx <= 0:
+            return messages
+
+        # Count ToolMessages from end to find the 3 most recent
+        tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+        recent_tool_set = set(tool_indices[-3:]) if len(tool_indices) > 3 else set(tool_indices)
+
+        out = []
+        for i, m in enumerate(messages):
+            if isinstance(m, ToolMessage):
+                content = m.content if isinstance(m.content, str) else str(m.content)
+                # Compress "already explored" results aggressively
+                if "Already explored" in content or "scanned" in content.split("\n", 1)[0]:
+                    m = m.copy(update={"content": "[VFS up to date]"})
+                elif i not in recent_tool_set and i < last_human_idx:
+                    # Old tool results before last human message: first line only
+                    first_line = content.split("\n", 1)[0]
+                    m = m.copy(update={"content": first_line})
+            out.append(m)
+        return out
+
+    @staticmethod
     def get_optimized_messages(messages: list[BaseMessage], agent_type: str, max_tokens: int = 120000) -> list[BaseMessage]:
         """Master entry point — prune, isolate, strip ghosts, then trim."""
         ctx = list(messages)
         ctx = ContextManager.prune_thinking(ctx)
         ctx = ContextManager.strip_ghost_messages(ctx)
         ctx = ContextManager.isolate_for_agent(ctx, agent_type)
+        ctx = ContextManager.summarize_old_tool_results(ctx)
         
         tokens_before = _estimate_tokens(ctx)
         
@@ -278,6 +320,7 @@ def get_performance_caps():
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    conversation_summary: str
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +334,13 @@ class ThinkingIndicator:
     - The background thread refreshes the display every REFRESH_MS milliseconds.
       Token arrivals only write to a buffer — they never trigger a display update.
       This prevents the jittery token-by-token flicker.
-    - The indicator doesn't appear until MIN_CHARS characters have accumulated,
+    - The reasoning excerpt only appears after MIN_CHARS characters have accumulated,
       so the user never sees a 1-2 word flash at the very start of reasoning.
     - transient=True on the Live erases the line completely when stop() is called.
+    - start() shows the indicator immediately (for all providers, not just reasoning ones).
     """
     REFRESH_MS  = 150    # display update interval in milliseconds
-    MIN_CHARS   = 80     # don't show indicator until this many chars accumulated
+    MIN_CHARS   = 80     # don't show excerpt until this many chars accumulated
     TAIL_LEN    = 68     # max chars of reasoning excerpt to display
 
     def __init__(self):
@@ -314,6 +358,8 @@ class ThinkingIndicator:
         """Return the tail of the accumulated buffer, trimmed to a word boundary."""
         with self._lock:
             raw = self._buffer.replace("\n", " ").replace("  ", " ").strip()
+        if len(raw) < self.MIN_CHARS:
+            return ""   # don't show excerpt until enough reasoning text
         if len(raw) <= self.TAIL_LEN:
             return raw
         tail = raw[-self.TAIL_LEN:]
@@ -347,33 +393,33 @@ class ThinkingIndicator:
     # Public API
     # ------------------------------------------------------------------
 
-    def feed(self, text: str):
-        """Append reasoning text to the buffer.
+    def start(self):
+        """Start the thinking indicator immediately.
 
-        Automatically starts the display once MIN_CHARS have accumulated.
-        Never touches the Live object directly — safe to call from the main thread.
+        Shows 'Thinking ...' right away for ALL providers (not just those
+        with reasoning_content).  Safe to call multiple times.
         """
-        if not text:
-            return
-        with self._lock:
-            self._buffer += text
-            ready = len(self._buffer) >= self.MIN_CHARS
-
-        if ready and not self._active:
+        if not self._active:
             self._active = True
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
+    def feed(self, text: str):
+        """Append reasoning text to the buffer (excerpt shown once MIN_CHARS reached)."""
+        if not text:
+            return
+        with self._lock:
+            self._buffer += text
+
     def stop(self):
-        """Stop the indicator and erase the line."""
+        """Stop the indicator and erase the line.  Idempotent."""
         if self._active:
             self._stop_event.set()
             if self._thread:
-                self._thread.join(timeout=1.0)
+                self._thread.join(timeout=2.0)
             self._active  = False
             self._thread  = None
-            # Reset buffer for next use
             with self._lock:
                 self._buffer = ""
 
@@ -383,11 +429,15 @@ class ThinkingIndicator:
 # ---------------------------------------------------------------------------
 
 def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name: str):
-    """Streams LLM response to console with reasoning frames, logs result, shows token usage."""
+    """Streams LLM response to console with reasoning frames, renders Markdown output."""
+    from rich.markdown import Markdown as RichMarkdown
+
     start = time.time()
     response_chunk = None
     in_reasoning = False
+    content_parts: list[str] = []
     thinking = ThinkingIndicator()
+    thinking.start()   # show indicator immediately for ALL providers
 
     for chunk in bound_llm.stream(trimmed, config=config):
         if hasattr(chunk, "additional_kwargs") and "reasoning_content" in chunk.additional_kwargs:
@@ -398,20 +448,26 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
                 thinking.feed(r)   # just write to buffer, never touch display directly
 
         if chunk.content:
-            if in_reasoning:
+            if not content_parts:
                 thinking.stop()    # erases the indicator line
+                _console.file.flush()
                 in_reasoning = False
-            _console.print(chunk.content, end="", style="bright_white")
+            content_parts.append(chunk.content)
 
         if response_chunk is None:
             response_chunk = chunk
         else:
             response_chunk += chunk
 
-    if in_reasoning:
-        thinking.stop()
+    # clean up indicator if model produced only reasoning / no content
+    thinking.stop()
 
-    _console.print()
+    # Render accumulated content as styled Markdown
+    if content_parts:
+        full_text = "".join(content_parts)
+        # Strip leaked FID references before display
+        full_text = re.sub(r"\[FID:\s*\d+\]", "", full_text)
+        _console.print(RichMarkdown(full_text))
     response = response_chunk
     duration = time.time() - start
 
@@ -423,7 +479,7 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
         prompt_tokens = response.usage_metadata.get("input_tokens", 0)
 
     if prompt_tokens:
-        MAX_CTX = 131072
+        MAX_CTX = config_manager.context_window
         pct = round((prompt_tokens / MAX_CTX) * 100, 1)
         bar_filled = int(pct / 5)
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
@@ -444,28 +500,116 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
 # Navigator Agent — Read-only exploration
 # ---------------------------------------------------------------------------
 
-nav_tools = [navigate, search_system, get_system_overview, call_executor]
-nav_tool_node = ToolNode(nav_tools)
+# Base nav tools (all presets). Expert adds run_shell dynamically.
+_nav_tools_base = [navigate, search_system, get_system_overview, collect_deletable_files, call_executor]
+_nav_tools_expert = _nav_tools_base + [run_shell]
+
+def _get_nav_tools():
+    """Return nav tool list based on active preset."""
+    preset = config_manager.config.get("preset", "Pro")
+    return _nav_tools_expert if preset == "Expert" else _nav_tools_base
+
+# ToolNode needs ALL possible tools registered so it can dispatch any of them.
+nav_tool_node = ToolNode(_nav_tools_expert)
+
+
+def _build_rule_summary(state: AgentState) -> str:
+    """Build a compact rule-based conversation summary for context anchoring.
+
+    Extracts the user's original question, top VFS findings, and recent
+    actions — all without an extra LLM call.  ~200 tokens.
+    """
+    parts = []
+
+    # 1. User's original question (first HumanMessage)
+    for m in state["messages"]:
+        if isinstance(m, HumanMessage):
+            q = m.content if isinstance(m.content, str) else str(m.content)
+            parts.append(f"USER ASKED: {q[:200]}")
+            break
+
+    # 2. Top VFS findings (largest 5 explored directories)
+    if session_book.nodes:
+        dirs = [
+            (p, n.get("size", 0))
+            for p, n in session_book.nodes.items()
+            if n.get("type") == "DIR" and n.get("size", 0) > 0
+        ]
+        dirs.sort(key=lambda x: x[1], reverse=True)
+        home = os.path.expanduser("~")
+        top = []
+        for p, s in dirs[:5]:
+            try:
+                rel = "~/" + os.path.relpath(p, home)
+            except (ValueError, TypeError):
+                rel = p
+            top.append(f"{rel} ({_human_size(s)})")
+        if top:
+            parts.append("TOP FINDINGS: " + ", ".join(top))
+
+    # 3. Recent actions from session history
+    history = persistent_memory.data.get("session_history", [])[-3:]
+    if history:
+        acts = "; ".join(f"{h['action']}: {h['finding'][:50]}" for h in history)
+        parts.append(f"RECENT ACTIONS: {acts}")
+
+    return "\n".join(parts) if parts else ""
+
+
+def _human_size(nbytes: int) -> str:
+    """Format bytes into human-readable string (duplicated here to avoid circular import)."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(nbytes) < 1024:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} PB"
 
 
 def navigator_node(state: AgentState, config: RunnableConfig):
     messages = list(state["messages"])
+    caps = get_performance_caps()
+    ctx_window = config_manager.context_window
+
     mem_ctx = persistent_memory.get_context_for_prompt()
-    book_view = session_book.render_tree()
+    book_view = session_book.render_tree(
+        max_chars=caps.get("tree_chars", 8000),
+        max_children_per_dir=caps.get("max_children", 15),
+    )
     
     active_prov = f"{config_manager.current_provider.upper()} ({config_manager.current_model})"
-    full_prompt = NAVIGATOR_PROMPT + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}\n\nSession Memory:\n{mem_ctx}\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
+    preset = config_manager.config.get("preset", "Pro")
+    full_prompt = get_navigator_prompt(preset, config_manager.current_provider) + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}"
+    if mem_ctx:
+        full_prompt += f"\n\nSession Memory:\n{mem_ctx}"
+
+    # Inject conversation summary (context anchor for long sessions)
+    summary = state.get("conversation_summary", "")
+    if summary:
+        full_prompt += f"\n\n[SESSION SUMMARY]\n{summary}"
+
+    if session_book.nodes:
+        full_prompt += f"\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
+
+    # Retrieve relevant macOS filesystem knowledge on demand
+    user_query = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            user_query = m.content if isinstance(m.content, str) else str(m.content)
+            break
+    guidebook_text = retrieve_guidebook(user_query, list(session_book.nodes.keys()))
+    if guidebook_text:
+        full_prompt += f"\n\n<macos_knowledge>\n{guidebook_text}\n</macos_knowledge>"
 
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SystemMessage(content=full_prompt)] + messages
     else:
         messages[0] = SystemMessage(content=full_prompt)
 
-    caps = get_performance_caps()
-    trimmed = ContextManager.get_optimized_messages(messages, "navigator")
+    trimmed = ContextManager.get_optimized_messages(messages, "navigator", max_tokens=ctx_window)
     
-    # Dynamic LLM binding with tools
-    llm_instance = get_llm().bind_tools(nav_tools)
+    # Dynamic LLM binding — Expert preset gets run_shell, others don't
+    active_tools = _get_nav_tools()
+    llm_instance = get_llm().bind_tools(active_tools)
     response = _stream_and_log(llm_instance, trimmed, config, "navigator")
     return {"messages": [response]}
 
@@ -479,19 +623,35 @@ exec_tool_node = ToolNode(exec_tools)
 
 def executor_node(state: AgentState, config: RunnableConfig):
     messages = list(state["messages"])
+    caps = get_performance_caps()
+    ctx_window = config_manager.context_window
+
     mem_ctx = persistent_memory.get_context_for_prompt()
-    book_view = session_book.render_tree()
+    book_view = session_book.render_tree(
+        max_chars=caps.get("tree_chars", 8000),
+        max_children_per_dir=caps.get("max_children", 15),
+    )
     
     active_prov = f"{config_manager.current_provider.upper()} ({config_manager.current_model})"
-    full_prompt = EXECUTOR_PROMPT + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}\n\nSession Memory:\n{mem_ctx}\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
+    preset = config_manager.config.get("preset", "Pro")
+    full_prompt = get_executor_prompt(preset, config_manager.current_provider) + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}"
+    if mem_ctx:
+        full_prompt += f"\n\nSession Memory:\n{mem_ctx}"
+
+    # Inject conversation summary (context anchor for long sessions)
+    summary = state.get("conversation_summary", "")
+    if summary:
+        full_prompt += f"\n\n[SESSION SUMMARY]\n{summary}"
+
+    if session_book.nodes:
+        full_prompt += f"\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
 
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SystemMessage(content=full_prompt)] + messages
     else:
         messages[0] = SystemMessage(content=full_prompt)
 
-    caps = get_performance_caps()
-    trimmed = ContextManager.get_optimized_messages(messages, "executor")
+    trimmed = ContextManager.get_optimized_messages(messages, "executor", max_tokens=ctx_window)
     
     # Dynamic LLM binding with tools
     llm_instance = get_llm().bind_tools(exec_tools)
@@ -503,11 +663,28 @@ def executor_node(state: AgentState, config: RunnableConfig):
 # Core Workflow Logic
 # ---------------------------------------------------------------------------
 
+def _count_recent_tool_calls(messages, since_tool_name: str = None) -> int:
+    """Count tool messages since the last agent handoff (call_executor/call_navigator).
+    This prevents Navigator's budget from being eaten by prior Executor turns and vice versa."""
+    count = 0
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            if m.name in ("call_executor", "call_navigator"):
+                break  # stop counting at the last handoff boundary
+            count += 1
+    return count
+
 def nav_should_continue(state: AgentState):
     messages = state["messages"]
     last = messages[-1]
-    tool_count = sum(1 for m in messages if hasattr(m, "type") and m.type == "tool")
     caps = get_performance_caps()
+    tool_count = _count_recent_tool_calls(messages)
+
+    # Update conversation summary at tier-specific intervals
+    interval = caps.get("summary_interval", 4)
+    if tool_count > 0 and tool_count % interval == 0:
+        state["conversation_summary"] = _build_rule_summary(state)
+
     if tool_count >= caps["nav_loops"]:
         return END
     if last.tool_calls:
@@ -517,9 +694,15 @@ def nav_should_continue(state: AgentState):
 def exec_should_continue(state: AgentState):
     messages = state["messages"]
     last = messages[-1]
-    tool_count = sum(1 for m in messages if hasattr(m, "type") and m.type == "tool")
     caps = get_performance_caps()
-    if tool_count >= (caps["nav_loops"] + caps["exec_loops"]):
+    tool_count = _count_recent_tool_calls(messages)
+
+    # Update conversation summary at tier-specific intervals
+    interval = caps.get("summary_interval", 4)
+    if tool_count > 0 and tool_count % interval == 0:
+        state["conversation_summary"] = _build_rule_summary(state)
+
+    if tool_count >= caps["exec_loops"]:
         return END
     if last.tool_calls:
         return "exec_tools"

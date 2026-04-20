@@ -73,8 +73,10 @@ class SessionBook:
                 "id_mapping": {str(k): v for k, v in self.id_mapping.items()},
                 "next_fid": self.next_fid,
             }
-            with open(VFS_PATH, "w") as f:
+            tmp = VFS_PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp, VFS_PATH)
         except IOError:
             pass
 
@@ -206,10 +208,18 @@ class SessionBook:
             "children": []
         }
         
+        # Minimum size for FILE entries to be stored in the VFS tree.
+        # Tiny files (< 1 MB) add noise without actionable value — users
+        # never delete individual sub-MB files.  Dirs always stored (navigable).
+        _VFS_FILE_FLOOR = 1024 * 1024  # 1 MB
+
         for e in entries:
             child_path = e['path'].rstrip('/')
-            self.nodes[parent_path]["children"].append(child_path)
             node_type = "DIR" if e.get("is_dir") else "FILE"
+            # Skip tiny files — they bloat the node count without value
+            if node_type == "FILE" and e.get('size', 0) < _VFS_FILE_FLOOR:
+                continue
+            self.nodes[parent_path]["children"].append(child_path)
             self.nodes[child_path] = {
                 "name": e['name'],
                 "path": child_path,
@@ -223,6 +233,11 @@ class SessionBook:
         if large_files:
             for lf in large_files:
                 lf_path = lf['path'].rstrip('/')
+                # Only attach large files that are actual direct children
+                # (depth 1). Deep files will appear when user navigates deeper.
+                lf_parent = os.path.dirname(lf_path)
+                if lf_parent != parent_path:
+                    continue
                 if lf_path not in self.nodes[parent_path]["children"]:
                     self.nodes[parent_path]["children"].append(lf_path)
                 self.nodes[lf_path] = {
@@ -266,16 +281,23 @@ class SessionBook:
             if path in node.get("children", []):
                 node["children"].remove(path)
 
-    def render_tree(self) -> str:
+    def render_tree(self, max_chars: int = 8000, max_children_per_dir: int = 20) -> str:
         """Builds the compact ASCII tree representation for the LLM.
-        Uses dirty-flag caching to avoid redundant serialization."""
+        Uses dirty-flag caching to avoid redundant serialization.
+        
+        Args:
+            max_chars: Character budget for the tree (~4 chars per token).
+            max_children_per_dir: Hard cap on children shown per directory.
+        """
         if not self._dirty and self._cached_tree:
             return self._cached_tree
             
         if not self.nodes:
-            self._cached_tree = "No directories explored yet. Use `navigate('~')` to begin mapping."
+            self._cached_tree = "No directories explored yet. Use navigate('~') to begin mapping."
             self._dirty = False
             return self._cached_tree
+
+        home = os.path.expanduser("~")
 
         # Find roots (nodes that are not children of any other node WE track)
         all_children = set()
@@ -288,20 +310,45 @@ class SessionBook:
         roots.sort(key=lambda p: self.nodes[p].get("size", 0), reverse=True)
         
         total_size = sum(n.get('size', 0) for n in self.nodes.values() if n.get('type') == 'DIR')
-        lines = [f"Current Knowledge Tree ({len(self.nodes)} nodes | {_human_size(total_size)} mapped):"]        
+        lines = [f"Filesystem map ({len(self.nodes)} nodes | {_human_size(total_size)} mapped). Paths are navigable with navigate(path). FIDs are for call_executor only."]
         
-        # Cap by characters rendered (what actually fills the context window),
-        # not by node count. Hidden '... and N more' lines consume zero tokens.
-        MAX_TREE_CHARS = 8000   # ≈2,000 tokens at 4 chars/token — 1.5% of 128k context
         chars_used = [len(lines[0])]
         
+        def _abbreviate_name(node):
+            """Build a compact display name for the tree."""
+            raw = node.get("name", "")
+            # Strip "(Large File)" suffix — size already conveys this
+            raw = raw.replace(" (Large File)", "")
+            # Display-only warning for large dirs (>1GB) — NOT stored in name
+            if node.get("type") == "DIR" and node.get("size", 0) >= 1024 ** 3:
+                raw = "⚠ " + raw
+            # Truncate hash-like filenames (>40 chars, no spaces)
+            if len(raw) > 40 and " " not in raw:
+                base, dot, ext = raw.rpartition(".")
+                if dot and len(ext) <= 6:
+                    raw = base[:16] + "…" + dot + ext
+                else:
+                    raw = raw[:16] + "…"
+            return raw
+        
+        def _abbreviated_path(node):
+            """For search-hit nodes, show ~/relative path so the LLM can navigate."""
+            path = node.get("path", "")
+            try:
+                return "~/" + os.path.relpath(path, home)
+            except (ValueError, TypeError):
+                return path
+
         def _build_tree_recursive(path, prefix="", is_last=True):
             node = self.nodes.get(path)
             if not node: return
-            if chars_used[0] >= MAX_TREE_CHARS:
+            if chars_used[0] >= max_chars:
+                return
+            # Skip 0-byte directories (noise from search results with no actual content)
+            if node["type"] in ("DIR", "ROOT") and node.get("size", 0) == 0 and not node.get("children"):
                 return
             
-            if "size_str" in node:
+            if "size_str" in node and "size" not in node:
                 size_display = node["size_str"]
             else:
                 size_display = _human_size(node.get("size", 0))
@@ -309,7 +356,13 @@ class SessionBook:
             icon = "📁" if node["type"] in ["DIR", "ROOT"] else "📄"
             if node["type"] == "CATEGORY": icon = "🧹"
             
-            # Print FID to save token count explicitly
+            display_name = _abbreviate_name(node)
+            
+            # For search-hit nodes not yet explored, show navigable path
+            if node.get("search_hit") and not node.get("scan_mtime"):
+                display_name = _abbreviated_path(node)
+            
+            # FID suffix for files
             if node["type"] in ["FILE", "CATEGORY"] and "fid" in node:
                 fid_suffix = f" [FID:{node['fid']}]"
             else:
@@ -318,7 +371,7 @@ class SessionBook:
             # Stale suffix for directories modified externally since last scan
             stale_suffix = " [↻ STALE]" if node.get("stale") else ""
             
-            line = f"{prefix}{icon} {node['name']} [{size_display}]{fid_suffix}{stale_suffix}"
+            line = f"{prefix}{icon} {display_name} [{size_display}]{fid_suffix}{stale_suffix}"
             lines.append(line)
             chars_used[0] += len(line) + 1  # +1 for newline
             
@@ -326,12 +379,11 @@ class SessionBook:
             children.sort(key=lambda c: self.nodes.get(c, {}).get("size", 0), reverse=True)
             
             # Dynamic child limit: show more children when char budget allows.
-            # Hard capped at 20 per directory to keep the list manageable for SLMs.
-            remaining = MAX_TREE_CHARS - chars_used[0]
+            remaining = max_chars - chars_used[0]
             avg_line_len = 60  # conservative avg chars per child line
             max_children_budget = max(5, remaining // avg_line_len)
-            max_children = min(20, max_children_budget)
-            display_children = children[:max_children]
+            effective_max = min(max_children_per_dir, max_children_budget)
+            display_children = children[:effective_max]
             hidden = len(children) - len(display_children)
             
             new_prefix = prefix.replace("├── ", "│   ").replace("└── ", "    ")
@@ -347,9 +399,9 @@ class SessionBook:
         for root in roots:
             _build_tree_recursive(root, prefix="")
         
-        if chars_used[0] >= MAX_TREE_CHARS:
+        if chars_used[0] >= max_chars:
             est_tokens = chars_used[0] // 4
-            lines.append(f"\n[Tree output capped at {MAX_TREE_CHARS} chars (~{est_tokens} tokens). Use navigate() to explore further.]")        
+            lines.append(f"\n[Tree capped at {max_chars} chars (~{est_tokens} tokens). Use navigate() to explore further.]")
         self._cached_tree = "\n".join(lines)
         self._dirty = False
         return self._cached_tree

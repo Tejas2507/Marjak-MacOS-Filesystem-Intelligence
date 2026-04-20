@@ -3,7 +3,7 @@
 # Verifies that the graph compiles and can accept a HumanMessage.
 
 from langchain_core.messages import HumanMessage
-from agent import master_app, NAV_MAX_LOOPS, EXEC_MAX_LOOPS
+from agent import master_app
 
 
 def test_graph_compiles():

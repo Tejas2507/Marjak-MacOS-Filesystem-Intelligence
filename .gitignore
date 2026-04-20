@@ -14,3 +14,4 @@ VFS_PLAYBOOK.txt
 runlogs/
 context_window_status.log
 *.log
+.DS_Store
