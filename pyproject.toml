@@ -1,7 +1,7 @@
 [project]
 name = "marjaka"
 version = "1.0.0"
-description = "Mārjak — macOS filesystem intelligence agent with Navigator + Executor architecture"
+description = "Mārjak — macOS filesystem intelligence agent with single-agent architecture"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

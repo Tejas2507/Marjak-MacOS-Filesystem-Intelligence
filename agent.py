@@ -1,10 +1,10 @@
-# agent.py — Mārjak v4: Hierarchical Context Management
+# agent.py — Mārjak v5: Single-Agent Architecture
 #
-# Navigator Agent: read-only exploration (navigate, search, scan, overview)
-# Executor Agent:  destructive actions (clean, optimize, move_to_trash)
+# One unified agent with both read and write tools.
+# Safety gates are in the tools themselves (Prompt.ask confirmation).
 #
-# Both use the same Gemma 4 model with reasoning=True.
-# They run sequentially — only 1 Ollama slot used at a time.
+# Both use the same LLM (auto-configured via /config).
+# They run sequentially — only 1 model slot used at a time.
 
 from typing import TypedDict, Annotated, Sequence
 from langchain_core.messages import (
@@ -27,7 +27,6 @@ from config_manager import config_manager
 
 from tools import (
     navigate,
-    mole_scan,
     search_system,
     get_system_overview,
     collect_deletable_files,
@@ -35,12 +34,10 @@ from tools import (
     execute_deep_clean,
     run_system_optimization,
     move_to_trash,
-    call_executor,
-    call_navigator,
     memory as persistent_memory,
     session_book,
 )
-from prompts import get_navigator_prompt, get_executor_prompt
+from prompts import get_prompt
 from guidebook import retrieve_guidebook
 import time
 import os
@@ -52,15 +49,37 @@ _console = Console(highlight=False)
 # Braille spinner frames for thinking indicator
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+# Track consecutive tool turns for display spacing
+_last_turn_was_tool: bool = False
+
+# Per-session runlog directory — set once per session via init_session_logging()
+_session_log_dir: str | None = None
+
+
+def init_session_logging(model: str = "", preset: str = ""):
+    """Create a per-session runlog subfolder: runlogs/<timestamp>-<model>-<preset>/
+
+    Call once at session start (from main.py or benchmark.py).
+    Subsequent write_llm_log calls write into this folder.
+    """
+    global _session_log_dir
+    model_tag = (model or config_manager.current_model).replace("/", "_").replace(":", "_")
+    preset_tag = preset or config_manager.config.get("preset", "Pro")
+    folder_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{model_tag}-{preset_tag}"
+    _session_log_dir = os.path.join("runlogs", folder_name)
+    os.makedirs(_session_log_dir, exist_ok=True)
+    return _session_log_dir
+
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 def write_llm_log(agent_name: str, messages: list, response, duration: float):
-    """Writes everything the LLM saw and did to runlogs/ for debugging."""
-    os.makedirs("runlogs", exist_ok=True)
-    filename = f"runlogs/{time.strftime('%Y%m%d-%H%M%S')}-{agent_name}.txt"
+    """Writes everything the LLM saw and did to the session's runlog folder."""
+    log_dir = _session_log_dir or "runlogs"
+    os.makedirs(log_dir, exist_ok=True)
+    filename = f"{log_dir}/{time.strftime('%Y%m%d-%H%M%S')}-{agent_name}.txt"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(f"=== LLM INVOCATION ({agent_name}) ===\n")
         f.write(f"Duration: {duration:.2f} seconds\n\n")
@@ -143,70 +162,22 @@ class ContextManager:
 
     @staticmethod
     def isolate_for_agent(messages: list[BaseMessage], agent_type: str) -> list[BaseMessage]:
-        """Ensures agents only see their relevant history to prevent cross-agent confusion."""
-        nav_tool_names = {"navigate", "search_system", "get_system_overview", "collect_deletable_files", "call_executor", "run_shell"}
-        exec_tool_names = {"execute_deep_clean", "run_system_optimization", "move_to_trash", "call_navigator"}
-        
-        my_tools = nav_tool_names if agent_type == "navigator" else exec_tool_names
-        
-        filtered = []
-        keep_ids = set()
-        
-        # Pre-pass: Identify tool call IDs we want to keep
-        for m in messages:
-            if isinstance(m, AIMessage) and m.tool_calls:
-                for t in m.tool_calls:
-                    if t["name"] in my_tools:
-                        keep_ids.add(t["id"])
-            # Executor specifically needs the handoff instruction from the Navigator
-            if agent_type == "executor" and isinstance(m, AIMessage) and m.tool_calls:
-                 for t in m.tool_calls:
-                     if t["name"] == "call_executor":
-                         keep_ids.add(t["id"])
-
-        for m in messages:
-            if isinstance(m, (HumanMessage, SystemMessage)):
-                filtered.append(m)
-            elif isinstance(m, AIMessage):
-                if not m.tool_calls:
-                    filtered.append(m)
-                else:
-                    if any(t["id"] in keep_ids for t in m.tool_calls):
-                        # Skip the Navigator's AI message that triggered the handoff
-                        if agent_type == "executor" and any(t["name"] == "call_executor" for t in m.tool_calls):
-                            continue
-                        filtered.append(m)
-            elif isinstance(m, ToolMessage):
-                if m.tool_call_id in keep_ids:
-                    # Convert call_executor result into a System Instruction for the Executor
-                    if agent_type == "executor" and m.name == "call_executor":
-                        filtered.append(SystemMessage(content=f"COMMAND INSTRUCTION: {m.content}"))
-                    else:
-                        filtered.append(m)
-                        
-        return filtered
+        """Pass-through for single-agent architecture. Keeps all messages."""
+        return messages
 
     @staticmethod
     def summarize_old_tool_results(messages: list[BaseMessage]) -> list[BaseMessage]:
         """Aggressively compress old tool results to prevent context rot.
 
         Strategy:
-        - Last 3 ToolMessages (by position): keep verbatim.
-        - Older ToolMessages: keep only the first line (summary).
+        - Last 1 ToolMessage: keep verbatim (model needs the latest result).
+        - Older ToolMessages: first line only (~25 tokens vs ~200).
         - "Already explored" navigate results: replace with short tag.
         - The VFS tree is refreshed every turn, so old results are redundant.
         """
-        last_human_idx = -1
-        for i, m in enumerate(messages):
-            if isinstance(m, HumanMessage):
-                last_human_idx = i
-
-        if last_human_idx <= 0:
-            return messages
-
-        # Count ToolMessages from end to find the 3 most recent
+        # Count ToolMessages from end to find the 1 most recent
         tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
-        recent_tool_set = set(tool_indices[-3:]) if len(tool_indices) > 3 else set(tool_indices)
+        recent_tool_set = set(tool_indices[-1:]) if len(tool_indices) > 1 else set(tool_indices)
 
         out = []
         for i, m in enumerate(messages):
@@ -215,9 +186,9 @@ class ContextManager:
                 # Compress "already explored" results aggressively
                 if "Already explored" in content or "scanned" in content.split("\n", 1)[0]:
                     m = m.copy(update={"content": "[VFS up to date]"})
-                elif i not in recent_tool_set and i < last_human_idx:
-                    # Old tool results before last human message: first line only
-                    first_line = content.split("\n", 1)[0]
+                elif i not in recent_tool_set:
+                    # Old tool results: first line only
+                    first_line = content.split("\n", 1)[0][:200]
                     m = m.copy(update={"content": first_line})
             out.append(m)
         return out
@@ -245,23 +216,12 @@ class ContextManager:
         tokens_after = _estimate_tokens(trimmed)
         pct = round((tokens_after / max_tokens) * 100, 1)
         
-        # Always-visible context window gauge (doesn't depend on Ollama response metadata)
-        bar_filled = int(pct / 5)   # 20 chars = 100%
-        bar_empty  = 20 - bar_filled
-        bar = "█" * bar_filled + "░" * bar_empty
-        color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
-        _console.print(
-            f"[dim]🧠 [{agent_type}] Context: [{color}]{bar}[/{color}] "
-            f"{tokens_after:,} / {max_tokens:,} est. tokens ({pct}%)"
-            + (f" [compressed {tokens_before - tokens_after:,}]" if tokens_before > tokens_after else "")
-            + "[/dim]"
-        )
-        
+        # Log context size silently (display moved to _stream_and_log with exact counts)
         with open("context_window_status.log", "a") as f:
             from datetime import datetime
             f.write(
                 f"[{datetime.now().strftime('%H:%M:%S')}] {agent_type}: "
-                f"{tokens_after}/{max_tokens} ({pct}%) msgs={len(trimmed)}\n"
+                f"{tokens_after}/{max_tokens} ({pct}%) msgs={len(trimmed)} est\n"
             )
         
         return trimmed
@@ -282,7 +242,51 @@ def get_llm():
     
     if provider == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(model=model, reasoning=True)
+        # Auto-detect model capabilities via Ollama /api/show
+        caps = set()
+        try:
+            import urllib.request, json as _json
+            resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    "http://localhost:11434/api/show",
+                    data=_json.dumps({"name": model}).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=3,
+            )
+            info = _json.loads(resp.read())
+            caps = set(info.get("capabilities", []))
+        except Exception:
+            pass  # Ollama unreachable or model not pulled — assume basic
+        if caps and "tools" not in caps:
+            raise ValueError(
+                f"Model '{model}' does not support tool calling "
+                f"(capabilities: {', '.join(sorted(caps)) or 'none'}). "
+                f"Mārjak requires a model with tool support. "
+                f"See: https://ollama.com/search?c=tools"
+            )
+        use_reasoning = "thinking" in caps
+        # Set num_ctx based on preset — smaller context = faster inference for Eco
+        preset = config_manager.config.get("preset", "Pro")
+        num_ctx = {"Eco": 8192, "Pro": 32768, "Expert": 131072}.get(preset, 32768)
+        # Auto-detect native context length from model metadata
+        native_ctx = 0
+        try:
+            mi = info.get("model_info", {})
+            for k, v in mi.items():
+                if k.endswith(".context_length") and isinstance(v, int):
+                    native_ctx = v
+                    break
+        except Exception:
+            pass
+        # Use the smaller of preset and native (don't exceed model's training)
+        if native_ctx > 0:
+            num_ctx = min(num_ctx, native_ctx)
+        config_manager._detected_num_ctx = num_ctx
+        opts = {"num_ctx": num_ctx}
+        if use_reasoning:
+            opts["reasoning"] = True
+        return ChatOllama(model=model, **opts)
     
     elif provider == "openai":
         from langchain_openai import ChatOpenAI
@@ -309,7 +313,7 @@ def get_llm():
             base_url=or_config.get("base_url", "https://openrouter.ai/api/v1")
         )
     
-    # Fallback to Ollama
+    # Fallback to Ollama gemma4 (known to support reasoning)
     from langchain_ollama import ChatOllama
     return ChatOllama(model="gemma4", reasoning=True)
 
@@ -321,6 +325,7 @@ def get_performance_caps():
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     conversation_summary: str
+    original_goal: str  # Anchored from first HumanMessage — survives "continue"
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +433,38 @@ class ThinkingIndicator:
 # Shared Streaming Helper (DRY)
 # ---------------------------------------------------------------------------
 
+def _build_hallucination_fallback(messages) -> str:
+    """Build a useful fallback when the model hallucinates instead of summarizing.
+
+    Extracts key data from ToolMessage results and the original question to
+    produce a >100 char response that actually answers the user.
+    """
+    # Find the user's question
+    user_q = ""
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            user_q = m.content if isinstance(m.content, str) else str(m.content)
+
+    # Extract key lines from each tool result
+    tool_summaries = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            lines = content.strip().split("\n")
+            # Take first meaningful line (header) + any lines with sizes
+            header = lines[0] if lines else ""
+            size_lines = [l.strip() for l in lines[1:20] if any(u in l for u in ("GB", "MB", "KB", "Gi", "Mi"))]
+            if header:
+                tool_summaries.append(header)
+            tool_summaries.extend(size_lines[:5])
+
+    if not tool_summaries:
+        return "I explored your filesystem but could not generate a complete summary. Please try a more specific question."
+
+    summary_text = "\n".join(f"• {line}" for line in tool_summaries[:15])
+    return f"Here's what I found on your system:\n\n{summary_text}\n\nPlease ask a follow-up if you'd like more detail on any of these."
+
+
 def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name: str):
     """Streams LLM response to console with reasoning frames, renders Markdown output."""
     from rich.markdown import Markdown as RichMarkdown
@@ -469,6 +506,34 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
         full_text = re.sub(r"\[FID:\s*\d+\]", "", full_text)
         _console.print(RichMarkdown(full_text))
     response = response_chunk
+
+    # --- Hallucination scrub ---
+    # Gemma4 sometimes generates fake tool output: response:unknown{value:<|"|>...
+    # This is the model hallucinating a navigate/search result instead of calling the tool.
+    # Detect and replace with a useful summary built from actual tool results.
+    if response and response.content:
+        c = response.content
+        if "response:unknown" in c or 'value:<|"|>' in c or "<tool_call|>" in c:
+            # Build a meaningful fallback from actual tool results in the conversation
+            fallback = _build_hallucination_fallback(trimmed)
+            response = response.copy(update={"content": fallback})
+            _console.print(f"[dim red]  ⚠ Hallucinated tool output detected and scrubbed[/dim red]")
+
+    # --- Reasoning-only rescue ---
+    # If model produced reasoning but no content and no tool calls,
+    # extract the last paragraph from reasoning as visible content.
+    if response and not response.content and not getattr(response, "tool_calls", None):
+        reasoning = (response.additional_kwargs or {}).get("reasoning_content", "")
+        if reasoning and len(reasoning) > 20:
+            # Take the last meaningful paragraph as the answer
+            paras = [p.strip() for p in reasoning.split("\n\n") if p.strip()]
+            rescued = paras[-1] if paras else reasoning[-500:]
+            if len(rescued) > 800:
+                rescued = rescued[:800] + "…"
+            response = response.copy(update={"content": rescued})
+            _console.print(RichMarkdown(rescued))
+            _console.print("[dim yellow]  (rescued from reasoning trace)[/dim yellow]")
+
     duration = time.time() - start
 
     # Token count: prefer Ollama's exact prompt_eval_count from the final streaming chunk.
@@ -484,12 +549,18 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
         bar_filled = int(pct / 5)
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
         color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+        # Add spacing between consecutive tool turns to avoid wall-of-text
+        global _last_turn_was_tool
+        has_tool_calls = hasattr(response, "tool_calls") and response.tool_calls
+        if _last_turn_was_tool and has_tool_calls:
+            _console.print()  # blank line separator
+        _last_turn_was_tool = bool(has_tool_calls)
         _console.print(
-            f"[dim]└─ 🧠 [{agent_name}] [{color}]{bar}[/{color}] "
-            f"{prompt_tokens:,} / {MAX_CTX:,} tokens (exact, {pct}%)[/dim]"
+            f"[dim]🧠 [{agent_name}] [{color}]{bar}[/{color}] "
+            f"{prompt_tokens:,} / {MAX_CTX:,} tokens ({pct}%)[/dim]"
         )
         with open("context_window_status.log", "a") as f:
-            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {agent_name}: {prompt_tokens} tokens EXACT\n")
+            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {agent_name}: {prompt_tokens}/{MAX_CTX} ({pct}%) EXACT\n")
 
     write_llm_log(agent_name, trimmed, response, duration)
     return response
@@ -497,20 +568,54 @@ def _stream_and_log(bound_llm, trimmed: list, config: RunnableConfig, agent_name
 
 
 # ---------------------------------------------------------------------------
-# Navigator Agent — Read-only exploration
+# Single Mārjak Agent — Unified read + write
 # ---------------------------------------------------------------------------
 
-# Base nav tools (all presets). Expert adds run_shell dynamically.
-_nav_tools_base = [navigate, search_system, get_system_overview, collect_deletable_files, call_executor]
-_nav_tools_expert = _nav_tools_base + [run_shell]
+# Base tools (all presets). Expert adds run_shell dynamically.
+_tools_base = [navigate, search_system, get_system_overview, collect_deletable_files,
+               move_to_trash, execute_deep_clean, run_system_optimization]
+_tools_expert = _tools_base + [run_shell]
 
-def _get_nav_tools():
-    """Return nav tool list based on active preset."""
+def _get_tools():
+    """Return tool list based on active preset."""
     preset = config_manager.config.get("preset", "Pro")
-    return _nav_tools_expert if preset == "Expert" else _nav_tools_base
+    return _tools_expert if preset == "Expert" else _tools_base
 
 # ToolNode needs ALL possible tools registered so it can dispatch any of them.
-nav_tool_node = ToolNode(_nav_tools_expert)
+tool_node = ToolNode(_tools_expert)
+
+# ---------------------------------------------------------------------------
+# Tool-Alias Repair — intercept hallucinated tool names before dispatch
+# ---------------------------------------------------------------------------
+_TOOL_ALIASES = {
+    "collect_candidates":           "collect_deletable_files",
+    "search_file_system":           "search_system",
+    "search_system_for_keywords":   "search_system",
+    "search_system_directories":    "navigate",
+    "search_system_for_user_data":  "search_system",
+    "search_files":                 "search_system",
+    "list_directory":               "navigate",
+    "find_files":                   "search_system",
+    "delete_files":                 "move_to_trash",
+}
+
+def tool_node_with_repair(state: AgentState):
+    """Fix hallucinated tool names, then dispatch to real ToolNode."""
+    messages = list(state["messages"])
+    last = messages[-1]
+    if isinstance(last, AIMessage) and last.tool_calls:
+        new_calls = []
+        repaired_any = False
+        for tc in last.tool_calls:
+            name = tc["name"]
+            if name in _TOOL_ALIASES:
+                tc = {**tc, "name": _TOOL_ALIASES[name]}
+                repaired_any = True
+            new_calls.append(tc)
+        if repaired_any:
+            messages[-1] = last.copy(update={"tool_calls": new_calls})
+            state = {**state, "messages": messages}
+    return tool_node.invoke(state)
 
 
 def _build_rule_summary(state: AgentState) -> str:
@@ -565,10 +670,157 @@ def _human_size(nbytes: int) -> str:
     return f"{nbytes:.1f} PB"
 
 
-def navigator_node(state: AgentState, config: RunnableConfig):
+# ---------------------------------------------------------------------------
+# Quick Mode — bypass LLM for trivial single-tool queries
+# ---------------------------------------------------------------------------
+
+_QUICK_PATTERNS: list[tuple[re.Pattern, str, dict]] = [
+    # "how much space", "disk space", "storage" → get_system_overview()
+    (re.compile(r"\b(how\s+much\s+space|disk\s*space|storage\s+overview|free\s+space)\b", re.I),
+     "get_system_overview", {}),
+    # "what's in /path" or "show /path" → navigate(path)
+    (re.compile(r"^(?:what(?:'s| is) in|show|list|ls)\s+([~/][\w/.\-]+)", re.I),
+     "navigate", None),  # None = extract arg from group(1)
+]
+
+
+def try_quick_mode(user_text: str) -> str | None:
+    """If *user_text* matches a known single-tool pattern, execute it directly
+    and return a formatted result string.  Returns ``None`` for fall-through to
+    the full LLM graph.
+
+    This saves 1-3 LLM round-trips for trivially-answerable queries.
+    """
+    for pat, tool_name, static_kwargs in _QUICK_PATTERNS:
+        m = pat.search(user_text)
+        if not m:
+            continue
+        try:
+            if tool_name == "get_system_overview":
+                result = get_system_overview.invoke({})
+            elif tool_name == "navigate":
+                path = m.group(1)
+                result = navigate.invoke({"path": path})
+            else:
+                continue
+            return str(result)
+        except Exception:
+            return None  # fall through on error
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Planner — lightweight keyword-based plan injection for multi-step queries
+# ---------------------------------------------------------------------------
+# Rules: conservative matching only. A wrong plan is WORSE than no plan.
+# Only inject when we're highly confident about the workflow.
+
+def _generate_plan(query: str) -> str:
+    """Return a short plan string for multi-step queries, or empty string.
+
+    Conservative: returns empty string for ambiguous queries. A wrong plan
+    actively hurts SLM performance by overriding the model's own reasoning.
+    """
+    if not query or len(query) < 10:
+        return ""
+    ql = query.lower()
+
+    # Clean/delete/optimize workflows (explicit action verbs + target)
+    if re.search(r"\b(clean|free\s+up|reclaim|delete|remove)\b", ql) and \
+       re.search(r"\b(space|disk|storage|cache|junk|temp)\b", ql):
+        return (
+            "1. get_system_overview() to check current disk usage\n"
+            "2. collect_deletable_files() to find reclaimable space\n"
+            "3. Report findings to user and ASK before deleting\n"
+            "4. Only call execute_deep_clean/move_to_trash if user explicitly confirms"
+        )
+
+    # "My Mac is slow / fix it" — diagnose only
+    if re.search(r"\b(slow|sluggish|lagging|freezing)\b", ql):
+        return (
+            "1. get_system_overview() ONCE to diagnose CPU/RAM/Disk\n"
+            "2. Summarize the diagnosis for the user\n"
+            "3. STOP — do NOT run cleanup tools without explicit user consent"
+        )
+
+    # Don't inject plans for anything else. The model's own reasoning
+    # is better than a wrong plan for navigate/search/explore queries.
+    return ""
+
+
+def _extract_tool_findings(messages) -> str:
+    """Build a condensed summary of tool results for force-stop nudge.
+
+    Keeps the first ~200 chars of each ToolMessage so the model has enough
+    context to produce a meaningful summary without exceeding the context window.
+    """
+    findings = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            # Grab the first line (tool header) plus truncated body
+            lines = content.split("\n")
+            header = lines[0] if lines else ""
+            body = "\n".join(lines[1:])
+            if len(body) > 200:
+                body = body[:200] + "…"
+            findings.append(f"- {header}\n  {body}" if body else f"- {header}")
+    return "\n".join(findings) if findings else "(No tool results captured)"
+
+
+def marjak_node(state: AgentState, config: RunnableConfig):
+    """Single unified agent node — handles exploration AND actions."""
     messages = list(state["messages"])
     caps = get_performance_caps()
     ctx_window = config_manager.context_window
+
+    # --- Force-stop detection ---
+    # When should_continue() routes back here (instead of to tools node),
+    # the last message is an AIMessage with tool_calls but NO ToolMessage
+    # after it.  Conditional edges cannot mutate state in LangGraph, so the
+    # nudge must be injected here — in the node function where state changes
+    # are properly tracked.
+    last_msg = messages[-1] if messages else None
+    force_summary = (
+        isinstance(last_msg, AIMessage)
+        and getattr(last_msg, "tool_calls", None)
+        and any(isinstance(m, ToolMessage) for m in messages)  # not first turn
+    )
+    if force_summary:
+        # Strip the dangling tool call the model produced
+        messages = messages[:-1]
+        # Build condensed findings from all prior tool results
+        findings = _extract_tool_findings(messages)
+        nudge = SystemMessage(
+            content=(
+                "STOP — you have used enough tool calls for this request.\n"
+                "Here is a summary of what your tools returned:\n"
+                f"{findings}\n\n"
+                "Now write a CLEAR, DETAILED summary for the user. "
+                "Include folder names, file sizes, and any recommendations. "
+                "Do NOT call any more tools."
+            )
+        )
+        messages.append(nudge)
+
+    # --- Empty-response retry detection ---
+    # If the model produced an empty response (no content, no tool_calls) and
+    # was routed back here, inject a nudge to try again.
+    elif (
+        isinstance(last_msg, AIMessage)
+        and not last_msg.content
+        and not getattr(last_msg, "tool_calls", None)
+        and any(isinstance(m, ToolMessage) for m in messages)
+    ):
+        findings = _extract_tool_findings(messages)
+        nudge = SystemMessage(
+            content=(
+                "You produced an empty response. Summarize what you found:\n"
+                f"{findings}\n"
+                "Answer the user's question with concrete details."
+            )
+        )
+        messages.append(nudge)
 
     mem_ctx = persistent_memory.get_context_for_prompt()
     book_view = session_book.render_tree(
@@ -578,7 +830,7 @@ def navigator_node(state: AgentState, config: RunnableConfig):
     
     active_prov = f"{config_manager.current_provider.upper()} ({config_manager.current_model})"
     preset = config_manager.config.get("preset", "Pro")
-    full_prompt = get_navigator_prompt(preset, config_manager.current_provider) + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}"
+    full_prompt = get_prompt(preset, config_manager.current_provider) + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}"
     if mem_ctx:
         full_prompt += f"\n\nSession Memory:\n{mem_ctx}"
 
@@ -591,160 +843,138 @@ def navigator_node(state: AgentState, config: RunnableConfig):
         full_prompt += f"\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
 
     # Retrieve relevant macOS filesystem knowledge on demand
+    # --- Original goal preservation ---
+    # Use original_goal if set; otherwise extract from first HumanMessage
+    original_goal = state.get("original_goal", "")
     user_query = ""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
             user_query = m.content if isinstance(m.content, str) else str(m.content)
             break
-    guidebook_text = retrieve_guidebook(user_query, list(session_book.nodes.keys()))
+    # Lock original_goal on the very first human message (not "continue"/"yes"/etc.)
+    if not original_goal and user_query and len(user_query) > 10:
+        original_goal = user_query
+    # For current_goal: use original_goal as anchor, append latest follow-up if different
+    goal_text = original_goal or user_query
+    if user_query and user_query != original_goal and len(user_query) > 10:
+        goal_text = f"{original_goal}\n(Follow-up: {user_query[:200]})"
+
+    guidebook_text = retrieve_guidebook(user_query or original_goal, list(session_book.nodes.keys()))
     if guidebook_text:
         full_prompt += f"\n\n<macos_knowledge>\n{guidebook_text}\n</macos_knowledge>"
 
+    # Inject a lightweight plan for multi-step queries (helps SLMs stay on track)
+    plan = _generate_plan(user_query or original_goal)
+    if plan:
+        full_prompt += f"\n\n<plan>\n{plan}\n</plan>"
+
+    # Anchor the user's goal prominently at the end of the system prompt
+    if goal_text:
+        full_prompt += (
+            f"\n\n<current_goal>\nThe user's request: {goal_text[:400]}\n"
+            "Follow the <plan> if provided. Fulfill this using tools. "
+            "You may explain your findings to the user between tool calls.\n</current_goal>"
+        )
+
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [SystemMessage(content=full_prompt)] + messages
     else:
         messages[0] = SystemMessage(content=full_prompt)
 
-    trimmed = ContextManager.get_optimized_messages(messages, "navigator", max_tokens=ctx_window)
+    trimmed = ContextManager.get_optimized_messages(messages, "marjak", max_tokens=ctx_window)
     
     # Dynamic LLM binding — Expert preset gets run_shell, others don't
-    active_tools = _get_nav_tools()
+    active_tools = _get_tools()
     llm_instance = get_llm().bind_tools(active_tools)
-    response = _stream_and_log(llm_instance, trimmed, config, "navigator")
-    return {"messages": [response]}
-
-
-# ---------------------------------------------------------------------------
-# Executor Agent — Destructive actions
-# ---------------------------------------------------------------------------
-
-exec_tools = [execute_deep_clean, run_system_optimization, move_to_trash, call_navigator]
-exec_tool_node = ToolNode(exec_tools)
-
-def executor_node(state: AgentState, config: RunnableConfig):
-    messages = list(state["messages"])
-    caps = get_performance_caps()
-    ctx_window = config_manager.context_window
-
-    mem_ctx = persistent_memory.get_context_for_prompt()
-    book_view = session_book.render_tree(
-        max_chars=caps.get("tree_chars", 8000),
-        max_children_per_dir=caps.get("max_children", 15),
-    )
-    
-    active_prov = f"{config_manager.current_provider.upper()} ({config_manager.current_model})"
-    preset = config_manager.config.get("preset", "Pro")
-    full_prompt = get_executor_prompt(preset, config_manager.current_provider) + f"\n\n[SYSTEM STATE]\nProvider: {active_prov}"
-    if mem_ctx:
-        full_prompt += f"\n\nSession Memory:\n{mem_ctx}"
-
-    # Inject conversation summary (context anchor for long sessions)
-    summary = state.get("conversation_summary", "")
-    if summary:
-        full_prompt += f"\n\n[SESSION SUMMARY]\n{summary}"
-
-    if session_book.nodes:
-        full_prompt += f"\n\n<vfs_playbook>\n{book_view}\n</vfs_playbook>"
-
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SystemMessage(content=full_prompt)] + messages
-    else:
-        messages[0] = SystemMessage(content=full_prompt)
-
-    trimmed = ContextManager.get_optimized_messages(messages, "executor", max_tokens=ctx_window)
-    
-    # Dynamic LLM binding with tools
-    llm_instance = get_llm().bind_tools(exec_tools)
-    response = _stream_and_log(llm_instance, trimmed, config, "executor")
-    return {"messages": [response]}
+    response = _stream_and_log(llm_instance, trimmed, config, "marjak")
+    return {"messages": [response], "original_goal": original_goal}
 
 
 # ---------------------------------------------------------------------------
 # Core Workflow Logic
 # ---------------------------------------------------------------------------
 
-def _count_recent_tool_calls(messages, since_tool_name: str = None) -> int:
-    """Count tool messages since the last agent handoff (call_executor/call_navigator).
-    This prevents Navigator's budget from being eaten by prior Executor turns and vice versa."""
+def _count_recent_tool_calls(messages) -> int:
+    """Count ToolMessages in the current conversation."""
     count = 0
     for m in reversed(messages):
         if isinstance(m, ToolMessage):
-            if m.name in ("call_executor", "call_navigator"):
-                break  # stop counting at the last handoff boundary
             count += 1
     return count
 
-def nav_should_continue(state: AgentState):
+def should_continue(state: AgentState):
+    """Decide whether to continue the tool loop or end.
+
+    IMPORTANT: This is a LangGraph conditional edge function.
+    It must ONLY return routing decisions — no state mutations.
+    All nudge injection happens in marjak_node() which is a proper node.
+    """
     messages = state["messages"]
     last = messages[-1]
     caps = get_performance_caps()
     tool_count = _count_recent_tool_calls(messages)
 
-    # Update conversation summary at tier-specific intervals
-    interval = caps.get("summary_interval", 4)
-    if tool_count > 0 and tool_count % interval == 0:
-        state["conversation_summary"] = _build_rule_summary(state)
+    # Use the combined budget: nav_loops + exec_loops (single agent gets both)
+    max_loops = caps["nav_loops"] + caps["exec_loops"]
 
-    if tool_count >= caps["nav_loops"]:
+    if isinstance(last, AIMessage) and last.tool_calls:
+        # --- Already tried force-stop? ---
+        # If the previous message is ALSO an AIMessage with tool_calls
+        # (no ToolMessage between them), force-stop was already attempted
+        # once and the model ignored the nudge. Give up.
+        if len(messages) >= 2 and isinstance(messages[-2], AIMessage) and getattr(messages[-2], "tool_calls", None):
+            return END
+
+        # --- Context-aware early stop ---
+        ctx_window = config_manager.context_window
+        est_tokens = _estimate_tokens(messages)
+        fill_pct = est_tokens / ctx_window if ctx_window > 0 else 0
+        if fill_pct > 0.75:
+            # Route back to marjak_node; it will detect the dangling tool call
+            # and inject compressed findings + nudge
+            return "marjak"
+
+        # --- Total tool-call depth check (since last HumanMessage) ---
+        tool_turns_since_human = 0
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                break
+            if isinstance(m, AIMessage) and m.tool_calls:
+                tool_turns_since_human += 1
+        if tool_turns_since_human >= 4:
+            # Route back to marjak_node for force-summary
+            return "marjak"
+
+        # Normal case: let the tool execute
+        return "tools"
+
+    # --- Budget exhaustion safeguard ---
+    if tool_count >= max_loops:
         return END
-    if last.tool_calls:
-        return "nav_tools"
+
+    # --- Empty response handling ---
+    if isinstance(last, AIMessage) and not last.content and not last.tool_calls:
+        # Check if we already retried (avoid infinite loop)
+        if len(messages) >= 2 and isinstance(messages[-2], SystemMessage):
+            return END  # Already nudged via marjak_node, give up
+        # Route back to marjak_node; it will detect empty response and add nudge
+        return "marjak"
+
     return END
-
-def exec_should_continue(state: AgentState):
-    messages = state["messages"]
-    last = messages[-1]
-    caps = get_performance_caps()
-    tool_count = _count_recent_tool_calls(messages)
-
-    # Update conversation summary at tier-specific intervals
-    interval = caps.get("summary_interval", 4)
-    if tool_count > 0 and tool_count % interval == 0:
-        state["conversation_summary"] = _build_rule_summary(state)
-
-    if tool_count >= caps["exec_loops"]:
-        return END
-    if last.tool_calls:
-        return "exec_tools"
-    return END
-
-def route_after_nav_tools(state: AgentState):
-    last = state["messages"][-1]
-    if hasattr(last, "name") and last.name == "call_executor":
-        _console.print("\n[bold cyan]⚡ Executor agent activated[/bold cyan]")
-        return "executor"
-    return "navigator"
-
-def route_after_exec_tools(state: AgentState):
-    last = state["messages"][-1]
-    if hasattr(last, "name") and last.name == "call_navigator":
-        _console.print("\n[bold cyan]⚡ Navigator agent reactivated[/bold cyan]")
-        return "navigator"
-    
-    # Short-circuit: if a core action just completed, end the turn immediately
-    if hasattr(last, "name") and last.name in ["move_to_trash", "execute_deep_clean", "run_system_optimization"]:
-        return END
-
-    return "executor"
 
 # ---------------------------------------------------------------------------
-# Construct the Unified Master Graph
+# Construct the Master Graph (Single Agent)
 # ---------------------------------------------------------------------------
 
 master_workflow = StateGraph(AgentState)
 
-master_workflow.add_node("navigator", navigator_node)
-master_workflow.add_node("nav_tools", nav_tool_node)
-master_workflow.add_node("executor", executor_node)
-master_workflow.add_node("exec_tools", exec_tool_node)
+master_workflow.add_node("marjak", marjak_node)
+master_workflow.add_node("tools", tool_node_with_repair)
 
-master_workflow.set_entry_point("navigator")
+master_workflow.set_entry_point("marjak")
 
-master_workflow.add_conditional_edges("navigator", nav_should_continue)
-master_workflow.add_conditional_edges("nav_tools", route_after_nav_tools)
-
-master_workflow.add_conditional_edges("executor", exec_should_continue)
-master_workflow.add_conditional_edges("exec_tools", route_after_exec_tools)
+master_workflow.add_conditional_edges("marjak", should_continue)
+master_workflow.add_edge("tools", "marjak")  # Always loop back after tool execution
 
 master_memory = MemorySaver()
 master_app = master_workflow.compile(checkpointer=master_memory)

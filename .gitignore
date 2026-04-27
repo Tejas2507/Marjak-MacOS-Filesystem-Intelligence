@@ -15,3 +15,4 @@ runlogs/
 context_window_status.log
 *.log
 .DS_Store
+dump/

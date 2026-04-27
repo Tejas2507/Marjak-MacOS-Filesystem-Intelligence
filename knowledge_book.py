@@ -86,7 +86,7 @@ class SessionBook:
         Three-pass validation on load:
         1. Deleted externally: path no longer exists -> pruned from VFS.
         2. Modified externally: directory mtime changed -> marked stale=[↻ STALE].
-           The Navigator will see this in the tree and know to re-navigate.
+           The agent will see this in the tree and know to re-navigate.
         3. Virtual nodes (Search Results, Mole Scan Results): kept as-is.
         """
         if not os.path.exists(VFS_PATH):
@@ -137,7 +137,7 @@ class SessionBook:
         # Pass 3: Auto-correct stale directories
         # For each stale dir, do a fast os.listdir() and prune children
         # that no longer exist on disk. We can fix deletions without the LLM.
-        # New files in the dir remain unknown — stale flag kept so Navigator re-explores.
+        # New files in the dir remain unknown — stale flag kept so the agent re-explores.
         auto_pruned = set()
         for path, node in list(nodes.items()):
             if not node.get("stale"):
@@ -182,7 +182,7 @@ class SessionBook:
 
 
     def get_paths_by_fids(self, fids: list) -> list:
-        """Translates FIDs back into actual system paths for the Executor."""
+        """Translates FIDs back into actual system paths for move_to_trash."""
         return [self.id_mapping.get(int(fid)) for fid in fids if int(fid) in self.id_mapping]
         
     def add_directory(self, parent_path: str, total_size: int, entries: list, large_files: list = None):
@@ -310,7 +310,7 @@ class SessionBook:
         roots.sort(key=lambda p: self.nodes[p].get("size", 0), reverse=True)
         
         total_size = sum(n.get('size', 0) for n in self.nodes.values() if n.get('type') == 'DIR')
-        lines = [f"Filesystem map ({len(self.nodes)} nodes | {_human_size(total_size)} mapped). Paths are navigable with navigate(path). FIDs are for call_executor only."]
+        lines = [f"Filesystem map ({len(self.nodes)} nodes | {_human_size(total_size)} mapped). Paths are navigable with navigate(path). FIDs are for move_to_trash only."]
         
         chars_used = [len(lines[0])]
         

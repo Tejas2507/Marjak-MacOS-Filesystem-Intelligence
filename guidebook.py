@@ -65,19 +65,28 @@ def _tokenize(text: str) -> set[str]:
 
 _TAG_WEIGHT = 2
 _PATH_WEIGHT = 3
-_MIN_SCORE = 2
+_MIN_SCORE = 3
 
 
 def _score_entry(entry: dict, query_tokens: set[str],
                  vfs_paths: list[str]) -> int:
-    """Score a guidebook entry against the user query and explored VFS paths."""
+    """Score a guidebook entry against the user query and explored VFS paths.
+
+    Scoring rules:
+    - Tag match:  +2 per query token found in entry tags (primary signal).
+    - Path match: +3 if a VFS path overlaps AND there is at least one tag hit.
+                  +1 if a VFS path overlaps but zero tag hits (weak context-only).
+    This prevents stale VFS paths from flooding results when the user changes topic.
+    """
     score = 0
 
     # Tag matching: +2 per query token that appears in entry tags
     entry_tags = set(entry.get("tags", []))
-    score += len(query_tokens & entry_tags) * _TAG_WEIGHT
+    tag_hits = len(query_tokens & entry_tags)
+    score += tag_hits * _TAG_WEIGHT
 
-    # Path matching: +3 if any VFS path starts with an entry path
+    # Path matching: strong bonus only when tags also match
+    path_matched = False
     for ep in entry.get("_expanded_paths", []):
         # Strip glob characters for prefix matching
         prefix = ep.split("*")[0].rstrip("/")
@@ -85,8 +94,13 @@ def _score_entry(entry: dict, query_tokens: set[str],
             continue
         for vp in vfs_paths:
             if vp.startswith(prefix):
-                score += _PATH_WEIGHT
-                break  # one match per entry path is enough
+                path_matched = True
+                break
+        if path_matched:
+            break
+
+    if path_matched:
+        score += _PATH_WEIGHT if tag_hits > 0 else 1
 
     return score
 
@@ -98,7 +112,12 @@ _CONFIDENCE_TAG = {"high": "✓docs", "medium": "~observed", "low": "?inferred"}
 
 
 def _format_entry(entry: dict) -> str:
-    """Format a single guidebook entry for LLM injection."""
+    """Format a single guidebook entry for LLM injection.
+
+    NOTE: Paths are deliberately OMITTED. The model must discover real paths
+    via search_system(). Injecting hardcoded paths causes Gemma4 to blindly
+    navigate nonexistent directories for apps that aren't installed.
+    """
     icon = _SAFETY_ICONS.get(entry.get("safety", ""), "")
     importance = entry.get("importance", 0)
     stars = "★" * importance + "☆" * (5 - importance)
@@ -108,7 +127,6 @@ def _format_entry(entry: dict) -> str:
     lines = [
         f"**{entry['id']}** [{entry['category']}/{etype}] "
         f"— {icon} {entry['safety'].upper()} — {stars} ({conf})",
-        f"  Paths: {', '.join(entry.get('paths', []))}",
         f"  Size: {entry.get('typical_size', 'unknown')}",
         f"  What: {entry.get('what', '').strip()}",
         f"  Delete OK? {entry.get('delete_ok', '').strip()}",

@@ -1,8 +1,7 @@
-# main.py — Mārjak: Two-Agent TUI with Handoff Logic
+# main.py — Mārjak: Single-Agent TUI
 #
-# Navigator handles all exploration. Executor handles all actions.
-# main.py detects whether the user is confirming a prior proposal
-# and routes to the correct agent.
+# One unified agent handles exploration, analysis, and cleanup.
+# Safety gates are in the tools themselves (Prompt.ask confirmation).
 
 import sys
 import re
@@ -23,7 +22,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
 
-from agent import master_app, persistent_memory, get_performance_caps
+from agent import master_app, persistent_memory, get_performance_caps, init_session_logging, try_quick_mode
 from tools import session_book
 from config_manager import config_manager
 
@@ -69,9 +68,9 @@ def print_banner(node_count: int = 0, is_fresh: bool = False):
 
     # ── Feature row ────────────────────────────────────────────────
     feat = Text(justify="center")
-    feat.append("Navigator", style="cyan")
+    feat.append("Explorer", style="cyan")
     feat.append("  ·  ", style="dim")
-    feat.append("Executor", style="cyan")
+    feat.append("Cleaner", style="cyan")
     feat.append("  ·  ", style="dim")
     feat.append("Memory", style="cyan")
     feat.append("  ·  ", style="dim")
@@ -267,14 +266,32 @@ def stream_agent(app, inputs, config, max_loops=15):
         # ── AI content: skip (already printed by _stream_and_log) ─
         # Nothing to do here — agent.py streams tokens to stdout.
 
-    # Check for empty response
+    # Check for empty response — synthesize from tool results as fallback
     final_state = app.get_state(config)
     if final_state and "messages" in final_state.values:
         last_msg = final_state.values["messages"][-1]
         if isinstance(last_msg, AIMessage) and not last_msg.content and not last_msg.tool_calls:
-            console.print(
-                "[bold yellow]⚠  No response. Try a more specific request.[/bold yellow]"
-            )
+            # Try to synthesize useful info from tool results
+            tool_summaries = []
+            for m in reversed(final_state.values["messages"]):
+                if isinstance(m, AIMessage) and m.content:
+                    break  # Stop at last real AI response
+                if hasattr(m, "type") and m.type == "tool" and m.content:
+                    content = str(m.content)
+                    first_line = content.split("\n", 1)[0].strip()
+                    if first_line and first_line != "[VFS up to date]":
+                        tool_summaries.append(first_line)
+            if tool_summaries:
+                console.print("[bold yellow]Here's what I found before running out of turns:[/bold yellow]")
+                for s in tool_summaries[:5]:
+                    if len(s) > 120:
+                        s = s[:117] + "…"
+                    console.print(f"  [dim]• {s}[/dim]")
+                console.print("[dim]Try a more specific follow-up to continue.[/dim]")
+            else:
+                console.print(
+                    "[bold yellow]⚠  No response. Try a more specific request.[/bold yellow]"
+                )
     console.print()
 
 def main():
@@ -282,6 +299,9 @@ def main():
     is_fresh = len(session_book.nodes) == 0
     node_count = len(session_book.nodes)
     print_banner(node_count=node_count, is_fresh=is_fresh)
+
+    # Initialize per-session runlog folder
+    init_session_logging()
 
     # Shared global session for the Master App — unique ID per run for fresh slate
     config = {"configurable": {"thread_id": f"session_{uuid.uuid4().hex[:8]}"}}
@@ -404,6 +424,13 @@ def main():
                 continue
 
             if not stripped:
+                continue
+
+            # Quick mode: bypass LLM for trivial single-tool queries
+            quick = try_quick_mode(stripped)
+            if quick is not None:
+                from rich.markdown import Markdown as RichMarkdown
+                console.print(RichMarkdown(quick))
                 continue
 
             inputs = {"messages": [HumanMessage(content=stripped)]}

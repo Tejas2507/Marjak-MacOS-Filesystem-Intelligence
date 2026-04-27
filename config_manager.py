@@ -40,7 +40,7 @@ class ConfigManager:
             },
             "performance": {
                 "Eco": {
-                    "nav_loops": 5, "exec_loops": 2, "tree_chars": 4000,
+                    "nav_loops": 5, "exec_loops": 2, "tree_chars": 2500,
                     "max_children": 8, "search_limit": 15,
                     "memory_hotspots": 5, "memory_actions": 5,
                     "summary_interval": 3
@@ -82,9 +82,22 @@ class ConfigManager:
     def api_keys(self):
         return {p: details.get("api_key", "") for p, details in self.config.get("providers", {}).items()}
 
+    # Runtime-detected num_ctx — set by get_llm() after querying Ollama /api/show
+    _detected_num_ctx: int = 0
+
     @property
     def context_window(self) -> int:
-        """Returns the context window size for the active provider."""
+        """Returns the effective context window size.
+
+        Priority: detected_num_ctx (from Ollama) > preset override > provider default.
+        """
+        if self._detected_num_ctx:
+            return self._detected_num_ctx
+        # Fallback to preset-based num_ctx (matches get_llm logic)
+        preset = self.config.get("preset", "Pro")
+        preset_ctx = {"Eco": 8192, "Pro": 32768, "Expert": 131072}.get(preset)
+        if preset_ctx:
+            return preset_ctx
         prov = self.config.get("providers", {}).get(self.current_provider, {})
         return prov.get("context_window", 131072)
 

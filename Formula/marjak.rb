@@ -32,7 +32,8 @@ class Marjaka < Formula
     # Copy the application source files into libexec
     libexec.install "main.py", "agent.py", "tools.py", "prompts.py",
                     "knowledge_book.py", "config_manager.py",
-                    "guidebook.py", "macos_guidebook.yaml"
+                    "guidebook.py", "macos_guidebook.yaml",
+                    "pyproject.toml"
 
     # Create a wrapper script that runs main.py with the venv Python
     (bin/"marjaka").write_env_script venv/"bin/python",

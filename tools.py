@@ -1,8 +1,9 @@
-# tools.py — Mole-Agent v3: LLM Navigates, Python Protects
+# tools.py — Mārjak v5: LLM Navigates, Python Protects
 #
-# 7 flexible tools split across two agents:
-#   Navigator: navigate, mole_scan, search_system, get_system_overview
-#   Executor:  execute_deep_clean, run_system_optimization, move_to_trash
+# All tools available to the single unified agent:
+#   navigate, mole_scan, search_system, get_system_overview,
+#   collect_deletable_files, move_to_trash, execute_deep_clean,
+#   run_system_optimization, run_shell (Expert only)
 
 import subprocess
 import json
@@ -207,7 +208,7 @@ def stream_command(cmd: list[str], task_name: str) -> str:
 
 
 # ===========================================================================
-# NAVIGATOR TOOLS — Read-only exploration
+# EXPLORATION TOOLS — Read-only filesystem discovery
 # ===========================================================================
 
 def _tag_waste(name: str) -> str:
@@ -302,9 +303,24 @@ def navigate(path: str) -> str:
 
     # Include navigable paths for top directories so the LLM doesn't have to reconstruct them
     home = os.path.expanduser("~")
+
+    # Surface hidden items (dotfiles/dotfolders) separately — Finder hides these
+    dotfiles = [e for e in sorted_entries if e['name'].startswith('.')]
+    dot_lines = []
+    for e in dotfiles[:8]:
+        try:
+            rel = "~/" + os.path.relpath(e['path'], home)
+        except (ValueError, TypeError):
+            rel = e['path']
+        kind = "DIR " if e.get("is_dir") else "FILE"
+        dot_lines.append(f"  {kind} {_human_size(e['size']):>10s} | {e['name']}")
+    hidden_note = ""
+    if dot_lines:
+        hidden_note = f"\nHidden items (invisible in Finder, {len(dotfiles)} total):\n" + "\n".join(dot_lines)
+
     dir_entries = [e for e in sorted_entries if e.get("is_dir")]
     nav_paths = []
-    for e in dir_entries[:5]:
+    for e in dir_entries[:8]:
         try:
             rel = "~/" + os.path.relpath(e['path'], home)
         except (ValueError, TypeError):
@@ -312,7 +328,7 @@ def navigate(path: str) -> str:
         nav_paths.append(f"  {rel} ({_human_size(e['size'])})")
     nav_hint = "\nNavigable dirs:\n" + "\n".join(nav_paths) if nav_paths else ""
 
-    # Surface large files with FIDs so the model can use call_executor directly
+    # Surface large files with FIDs so the model can use move_to_trash directly
     file_entries = [e for e in sorted_entries if not e.get("is_dir") and e.get("size", 0) >= 1024 * 1024]
     big_files = []
     for e in file_entries[:8]:
@@ -323,13 +339,13 @@ def navigate(path: str) -> str:
             rel = e['path']
         fid_tag = f" [FID:{fid}]" if fid else ""
         big_files.append(f"  {_human_size(e['size']):>10s} | {e['name']}{fid_tag}")
-    file_hint = "\nFiles (use call_executor with FIDs to delete):\n" + "\n".join(big_files) if big_files else ""
+    file_hint = "\nFiles (use move_to_trash with FIDs to delete):\n" + "\n".join(big_files) if big_files else ""
 
     console.print(f"[bold red]✔ Explored {path}[/bold red]\n")
     return (
         f"Explored {path} ({_human_size(total_size)}, {len(entries)} items). "
         f"Top: {top3}. {len(large_files)} large files.{waste_note}"
-        f"{nav_hint}{file_hint}"
+        f"{nav_hint}{file_hint}{hidden_note}"
     )
 
 
@@ -467,13 +483,20 @@ def search_system(name: str, file_type: str = "any") -> str:
     except Exception:
         pass
 
-    # Source 2: find universally across Home folder (depth=5), pruning hidden massive traps and Library
+    # Source 2: find across Home folder (depth=5), pruning Library (searched in Source 1)
+    # and known massive hidden dirs that cause timeouts
+    _PRUNE_DIRS = (".Trash", "node_modules", ".git", "__pycache__")
+    prune_names = ["-name", "Library"]
+    for d in _PRUNE_DIRS:
+        prune_names.extend(["-o", "-name", d])
+    prune_expr = ["-type", "d", "("] + prune_names + [")", "-prune"]
+
     try:
-        cmd = [
-            "find", home, "-maxdepth", "5", 
-            "-type", "d", "(", "-name", ".*", "-o", "-name", "Library", ")", "-prune", 
-            "-o", "-iname", fuzzy_name
-        ]
+        cmd = (
+            ["find", home, "-maxdepth", "5"]
+            + prune_expr
+            + ["-o", "-iname", fuzzy_name]
+        )
         if type_flag:
             cmd.extend(type_flag)
         cmd.append("-print")
@@ -510,6 +533,20 @@ def search_system(name: str, file_type: str = "any") -> str:
             seen_real.add(real)
             unique_results.append(path)
     results = unique_results
+
+    # ── Filter out development noise (venvs, site-packages, pip caches) ──
+    # These match app names like "slack", "discord" etc. but are just
+    # Python/Node packages — not the actual app data the user is asking about.
+    _NOISE_SEGMENTS = {"site-packages", "node_modules", ".venv", "venv",
+                       "__pycache__", ".tox", "dist-packages", ".eggs"}
+    def _is_noise(p: str) -> bool:
+        parts = p.split(os.sep)
+        return bool(_NOISE_SEGMENTS.intersection(parts))
+
+    clean_results = [p for p in results if not _is_noise(p)]
+    noise_results = [p for p in results if _is_noise(p)]
+    # Append noise at the end so they only show if nothing better was found
+    results = clean_results + noise_results
 
     # ── Enrich with sizes, filter zero-byte dirs ──
     enriched = []
@@ -635,7 +672,7 @@ def search_system(name: str, file_type: str = "any") -> str:
         report = f"No results found for '{name}'."
     else:
         lines = [f"Found {len(enriched)} results for '{name}':"]
-        for item in enriched[:8]:
+        for item in enriched[:12]:
             path = item["path"]
             try:
                 rel = "~/" + os.path.relpath(path, home)
@@ -643,8 +680,8 @@ def search_system(name: str, file_type: str = "any") -> str:
                 rel = path
             kind = "DIR " if item["is_dir"] else "FILE"
             lines.append(f"  {kind} {item['size_str']:>10s} | {rel}")
-        if len(enriched) > 8:
-            lines.append(f"  ... and {len(enriched) - 8} more")
+        if len(enriched) > 12:
+            lines.append(f"  ... and {len(enriched) - 12} more")
         if auto_navigated:
             lines.append(f"Auto-explored: {', '.join(os.path.basename(p) for p in auto_navigated)}")
         lines.append("Navigate into the largest directories for file-level detail.")
@@ -723,19 +760,11 @@ def get_system_overview() -> str:
 
 
 @tool
-def call_executor(instructions: str) -> str:
-    """Transfer control to the Executor Agent to perform destructive tasks. 
-    Use this if the user wants to delete files. Pass the FIDs in the instructions.
-    """
-    return f"Handing off to Executor with instructions: {instructions}"
-
-
-@tool
 def collect_deletable_files(path: str, min_size_mb: int = 0, name_pattern: str = "", exclude_pattern: str = "") -> str:
     """Query the explored filesystem tree for files under a directory.
-    Returns file names, sizes, and FIDs ready to pass to call_executor.
+    Returns file names, sizes, and FIDs ready to pass to move_to_trash.
 
-    Use this BEFORE call_executor to get the exact FID list.
+    Use this BEFORE move_to_trash to get the exact FID list.
 
     Args:
         path: Directory path to search under (e.g. '~/Library/.../media').
@@ -810,8 +839,8 @@ def collect_deletable_files(path: str, min_size_mb: int = 0, name_pattern: str =
                 trel = expanded
             return (
                 f"No individual files{filter_desc} found under {path}, but the directory itself is {_human_size(tsize)}.\n"
-                f"To delete the entire directory: call_executor(\"Delete FID {target_node['fid']} — {trel} ({_human_size(tsize)})\")\n"
-                f"Or navigate({path}) first to see its contents before deciding."
+                f"→ To delete it, call move_to_trash with file_ids=[{target_node['fid']}]\n"
+                f"→ Or call navigate(\"{path}\") to see its contents before deciding."
             )
         return f"No files matching{filter_desc} found under {path}. Navigate into it first with navigate(\"{path}\")."
 
@@ -828,20 +857,16 @@ def collect_deletable_files(path: str, min_size_mb: int = 0, name_pattern: str =
     for m in matches:
         tag = "DIR" if m["type"] == "DIR" else "FILE"
         lines.append(f"  FID:{m['fid']} | {m['size_str']:>10s} | [{tag}] {m['name']}")
-    lines.append(f"\nFID list for call_executor: {fid_list}")
-    lines.append(f'call_executor("Delete FIDs {fid_list} — {" + ".join(type_desc)}, {_human_size(total)} total")')
+    lines.append(f"\n→ NEXT STEP: call move_to_trash(file_ids={fid_list}) to delete these ({_human_size(total)} total)")
 
     return "\n".join(lines)
 
 
-@tool
-def call_navigator(instructions: str) -> str:
-    """Transfer control back to the Navigator Agent to explore more files."""
-    return f"Handing off to Navigator with instructions: {instructions}"
+
 
 
 # ===========================================================================
-# EXECUTOR TOOLS — Destructive actions (user must confirm first)
+# ACTION TOOLS — Destructive actions (user must confirm first)
 # ===========================================================================
 
 @tool
@@ -1037,7 +1062,7 @@ def run_shell(command: str) -> str:
 
     # Deny list check (exact match on base command)
     if base_cmd in _SHELL_DENY:
-        return f"BLOCKED: '{base_cmd}' is not permitted. Use Executor tools for destructive actions."
+        return f"BLOCKED: '{base_cmd}' is not permitted. Use move_to_trash or execute_deep_clean for destructive actions."
 
     # Allow list check
     if base_cmd not in _SHELL_ALLOW:
