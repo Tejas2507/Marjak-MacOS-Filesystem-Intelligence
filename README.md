@@ -13,6 +13,10 @@
 
 <p align="center"><em>macOS Filesystem Intelligence — powered by AI that runs on your machine.</em></p>
 
+<p align="center">
+  <img src="assets/banner.png" alt="Mārjak Banner and System Overview" width="90%">
+</p>
+
 ---
 
 ## The Problem
@@ -22,6 +26,10 @@ Every Mac user knows the pain. That dreaded **"Your disk is almost full"** notif
 **Mārjak solves this in one conversation.**
 
 It doesn't just scan — it **reasons**. It maps your filesystem into a compressed virtual tree, drills into directories level by level, identifies patterns, and explains what's safe to delete. All through natural language, right in your terminal.
+
+<p align="center">
+  <img src="assets/analysis.png" alt="Mārjak deep analysis of Brave Browser storage" width="100%">
+</p>
 
 ```
 ❯ my mac is running out of space, help me clean up
