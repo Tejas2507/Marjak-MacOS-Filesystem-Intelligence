@@ -1,0 +1,6 @@
+Mārjak  Session Playbook
+====================================================
+  Nodes: 0  |  FIDs: 0
+────────────────────────────────────────────────────
+
+No directories explored yet. Use navigate('~') to begin mapping.
