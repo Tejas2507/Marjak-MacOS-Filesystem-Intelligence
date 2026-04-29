@@ -13,10 +13,6 @@
 
 <p align="center"><em>macOS Filesystem Intelligence — powered by AI that runs on your machine.</em></p>
 
-<p align="center">
-  <img src="assets/banner.png" alt="Mārjak Banner and System Overview" width="90%">
-</p>
-
 ---
 
 ## The Problem
@@ -26,10 +22,6 @@ Every Mac user knows the pain. That dreaded **"Your disk is almost full"** notif
 **Mārjak solves this in one conversation.**
 
 It doesn't just scan — it **reasons**. It maps your filesystem into a compressed virtual tree, drills into directories level by level, identifies patterns, and explains what's safe to delete. All through natural language, right in your terminal.
-
-<p align="center">
-  <img src="assets/analysis.png" alt="Mārjak deep analysis of Brave Browser storage" width="100%">
-</p>
 
 ```
 ❯ my mac is running out of space, help me clean up
@@ -57,11 +49,12 @@ Want me to start cleaning? I'll show you exactly what gets deleted before touchi
 
 - **Deep Filesystem Intelligence** — Explores `~/Library`, app containers, caches, dotfiles, and system internals that Finder hides from you.
 - **Single-Agent Architecture** — One unified agent with exploration and action tools. Safety gates live in the tools: `move_to_trash` shows a preview and asks for confirmation.
-- **VFS Playbook** — Compresses your explored filesystem into a token-efficient virtual tree with integer File IDs. A 12B model can reason about 50GB+ of directories.
+- **Hybrid Memory** — Session playbook (in-memory tree with zoom rendering) + persistent SQLite store (directory-level knowledge that survives across sessions).
 - **Local-First** — Optimized for [Ollama](https://ollama.com) with **Gemma 4**, but works with OpenAI, Gemini, Claude, Groq, and OpenRouter.
 - **Powered by [Mole](https://github.com/mole-org/mole)** — Uses the Mole binary for high-speed filesystem analysis and deep cleaning. Mārjak is the AI brain; Mole is the muscle.
 - **Safety by Design** — Protected paths are hard-blocked. Files go to Trash (recoverable). Every destructive action requires confirmation.
 - **Three Presets** — Eco for fast small models, Pro for balanced depth, Expert with shell access for power users.
+- **First-Run System Mapping** — Silently scans `~` and `~/Library` on first launch to give the model instant awareness of your system layout.
 
 ---
 
@@ -71,7 +64,7 @@ Want me to start cleaning? I'll show you exactly what gets deleted before touchi
 
 ```bash
 brew tap tejas/marjak https://github.com/tejas/marjak.git
-brew install marjaka
+brew install marjak
 ```
 
 This installs Mārjak + [Mole](https://github.com/mole-org/mole) together. Then:
@@ -80,7 +73,7 @@ This installs Mārjak + [Mole](https://github.com/mole-org/mole) together. Then:
 brew install ollama       # local AI backend
 ollama serve &
 ollama pull gemma4        # ~5GB download, one time
-marjaka                   # launch
+marjak                    # launch
 ```
 
 ### From Source
@@ -93,12 +86,14 @@ uv sync
 
 brew install ollama && ollama serve &
 ollama pull gemma4
-uv run python main.py
+uv run python -m marjak
 ```
 
 ### First Launch
 
-Works out of the box with **Ollama + Gemma 4**. To switch providers:
+Works out of the box with **Ollama + Gemma 4**. On first launch, Mārjak silently maps your home directory and `~/Library` (~40 directories, ~3 seconds) so the model has instant system awareness.
+
+To switch providers:
 
 ```
 ❯ /config
@@ -129,9 +124,11 @@ Just type what you want:
 | `/scan` | Quick waste preview (nothing deleted) |
 | `/deep_clean` | Purge system caches (preview → confirm → execute) |
 | `/optimize` | Refresh OS databases and caches |
-| `/playbook` | View the VFS knowledge tree |
-| `/wipe` | Erase all Mārjak data |
-| `/quit` | Save and exit |
+| `/playbook` | View session tree + persistent memory |
+| `/wipe` | Clear current session (persistent memory retained) |
+| `/wipe --all` | Erase all Mārjak data (session + persistent) |
+| `/forget <path>` | Remove a specific path from persistent memory |
+| `/quit` | Exit |
 
 ---
 
@@ -148,15 +145,22 @@ Just type what you want:
 │  │          │───deep_clean()────│          │            │
 │  │          │◄──results─────────│          │            │
 │  └──────────┘    run_shell()*   └──────────┘            │
+│       │                              │                  │
+│       ▼                              ▼                  │
+│  Session Playbook              Persistent Store         │
+│  (in-memory tree)              (SQLite, survives        │
+│                                 across sessions)        │
 │                                                         │
 │  * Expert preset only                                   │
 │  † Destructive tools show preview + ask confirmation    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Single agent, all tools.** Mārjak explores your filesystem, builds a virtual map (the VFS Playbook), and identifies targets. Cleanup actions show a preview and require user confirmation.
+**Single agent, all tools.** Mārjak explores your filesystem, builds a session tree, and identifies targets. Cleanup actions show a preview and require user confirmation.
 
-**The VFS Playbook** is the secret sauce — a compressed ASCII tree injected into the system prompt every turn. It stores directories, sizes, and integer FIDs so the LLM can reference `~/Library/Caches/com.spotify.client` as `FID:42` using 5 tokens instead of 50.
+**Hybrid Memory:**
+- **Session Playbook** — In-memory compressed ASCII tree (max 40 nodes, zoom rendering). Injected into the system prompt every turn as `<explored_this_session>`. FIDs let the LLM reference paths compactly.
+- **Persistent Store** — SQLite database at `~/.marjak/fs_memory.db`. Directory-level only (files are ephemeral). Skeleton rows from first-run scan never evicted. Explored directories use LRU eviction (500-row cap). Injected as `<system_knowledge>`.
 
 ### Performance Presets
 
@@ -203,25 +207,30 @@ For Ollama, only models with tool support work. Browse at [ollama.com/search?c=t
 ## Architecture
 
 ```
-main.py                 TUI loop, slash commands, Rich UI
+src/marjak/
+├── cli.py              TUI loop, slash commands, Rich UI
 ├── agent.py            LangGraph StateGraph, context management, force-stop logic
 ├── tools.py            navigate, search_system, get_system_overview,
 │                       collect_deletable_files, move_to_trash, execute_deep_clean,
 │                       run_system_optimization, run_shell (Expert only)
 ├── prompts.py          Tiered prompt system (Eco / Pro / Expert)
-├── knowledge_book.py   SessionBook: VFS tree, FID mapping, stale detection
+├── session_book.py     Session playbook: in-memory tree, FID mapping, zoom rendering
+├── fs_memory.py        Persistent SQLite store: directory knowledge, search hits, actions
 ├── guidebook.py        Tag-based macOS filesystem knowledge retrieval
-├── macos_guidebook.yaml  36 curated entries: safety ratings, reclaimable paths
-└── config_manager.py   Provider / model / preset config (~/.marjak/)
+├── config.py           Provider / model / preset config (~/.marjak/)
+└── data/
+    └── macos_guidebook.yaml  36 curated entries: safety ratings, reclaimable paths
 ```
 
 ### Design Principles
 
 - **1MB file floor** — Sub-MB files aren't tracked. Thousands of thumbnails collapse into meaningful nodes.
 - **Handoff-free** — Single agent, all tools. No multi-agent coordination overhead.
-- **Context rot prevention** — Old tool results auto-summarized. VFS tree refreshes every turn.
+- **Context rot prevention** — Old tool results auto-summarized. Session tree refreshes every turn with zoom rendering.
 - **FID-based deletion** — LLM never sees raw paths for destructive ops. Protected paths hard-blocked.
 - **Gated shell** — Expert-only `run_shell` with command whitelisting and per-command user approval.
+- **Path display fix** — Root nodes in the tree show `~/relative` paths. The LLM sees navigable paths, not basenames.
+- **Zoom rendering** — Ancestors of the focus node are collapsed. Only the current exploration area is fully expanded.
 
 ---
 
@@ -232,22 +241,24 @@ Everything stays on your machine.
 | Path | Contents |
 |---|---|
 | `~/.marjak/config.json` | Provider settings, API keys |
-| `~/.marjak/memory.json` | Hotspot tracking, action history |
-| `~/.marjak/session_book.json` | VFS tree (validates paths on restart) |
+| `~/.marjak/fs_memory.db` | Persistent directory knowledge (SQLite) |
 
-Zero telemetry. Zero cloud sync. `rm -rf ~/.marjak` to reset completely.
+The session playbook is in-memory only — nothing persists between sessions except the SQLite store.
+
+Zero telemetry. Zero cloud sync. `rm -rf ~/.marjak` to reset completely, or use `/wipe --all` within the app.
 
 ---
 
 ## Development
 
 ```bash
-uv run python main.py              # Full run with Ollama
-uv run ruff check .                # Lint
-uv run python dump/benchmark.py    # Run benchmarks (20 test cases)
+uv run python -m marjak            # Full run with Ollama
+uv run ruff check src/              # Lint
+uv run python scripts/benchmark.py  # Run benchmarks (20 test cases)
+uv run pytest tests/                # Run tests
 ```
 
-Benchmark and test utilities live in `dump/` — not shipped to users but available for development.
+Test and benchmark utilities live in `tests/` and `scripts/`.
 
 ---
 
